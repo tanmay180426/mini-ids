@@ -5,16 +5,16 @@ Responsible for reading network packets from offline PCAP files and
 live network interfaces using Scapy.
 """
 
-from .live_capture import (
-    LiveCaptureWorker,
-    get_available_interfaces,
-    get_live_worker,
-)
 from .packet_capture import (
     NormalizedPacket,
     iter_pcap,
     normalize_packet,
     read_pcap,
+)
+from .live_capture import (
+    LiveCaptureWorker,
+    get_available_interfaces,
+    get_live_worker,
 )
 
 __all__ = [

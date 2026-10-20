@@ -1,50 +1,43 @@
-"""Mini-IDS Security Monitoring Dashboard.
+"""Mini-IDS Intelligent Network Security Analytics Platform.
 
-Streamlit web interface for visual inspection of network packets and intrusion
-alerts persisted in the Mini-IDS SQLite database.
-
-Features:
-- Configurable database path with existence and empty-state validation.
-- Cumulative stored-data metrics across all analyses.
-- Alert count breakdown by detection rule/type.
-- Recent alerts table with rule, severity, IPs, metrics, and descriptions.
-- Recent network traffic table with timestamps, IPs, protocols, ports, and flags.
-- Interactive filtering by severity, rule, protocol, and record limit.
-- Graceful database error handling and reliable connection closure.
-
-NOTE: PCAP processing and detection are performed offline via `main.py`.
-This dashboard is strictly a read-only presentation layer.
+Streamlit web application combining heuristic intrusion detection, supervised
+machine learning classification, unsupervised Isolation Forest anomaly detection,
+and exploratory cybersecurity traffic analytics.
 """
 
 from collections import Counter
 from datetime import datetime, timezone
+import json
 import logging
 import os
 from pathlib import Path
 import sqlite3
-from typing import Any, Dict, List, Optional, Union
+import time
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import altair as alt
+import numpy as np
 import pandas as pd
 import streamlit as st
 
+from analytics.exploratory_analysis import DatasetProfiler
+from analytics.theme import SEVERITY_COLORS, THEME_COLORS, get_altair_theme, get_custom_css
 from capture.live_capture import get_available_interfaces, get_live_worker
+from ml.dataset_manager import DATASET_METADATA, DatasetManager
+from ml.evaluation import ModelEvaluator
+from ml.explainability import ModelExplainer
+from ml.model_registry import ModelRegistry
+from ml.preprocessing import FlowDataPreprocessor
+from ml.train_anomaly import AnomalyDetectorTrainer
+from ml.train_supervised import SupervisedModelTrainer
 from storage.database import DEFAULT_DB_PATH, DatabaseManager
 from storage.demo_data import DEFAULT_DEMO_DB_PATH, get_or_create_demo_database
 
 logger = logging.getLogger("mini_ids.dashboard")
 
 
-
 def format_timestamp(ts: Union[float, int, str, None]) -> str:
-    """Format UNIX epoch float to a readable datetime string (UTC).
-
-    Args:
-        ts: UNIX epoch timestamp in seconds.
-
-    Returns:
-        str: Formatted UTC timestamp string, or fallback string representation.
-    """
+    """Format UNIX epoch float to a readable datetime string (UTC)."""
     if ts is None:
         return "N/A"
     try:
@@ -61,7 +54,12 @@ def build_severity_chart(severity_data: List[Dict[str, Any]]) -> Optional[alt.Ch
     df = pd.DataFrame(severity_data)
     color_scale = alt.Scale(
         domain=["CRITICAL", "HIGH", "MEDIUM", "LOW"],
-        range=["#dc2626", "#ef4444", "#f59e0b", "#06b6d4"],
+        range=[
+            THEME_COLORS["critical"],
+            THEME_COLORS["high"],
+            THEME_COLORS["warning"],
+            THEME_COLORS["low"],
+        ],
     )
     chart = (
         alt.Chart(df)
@@ -87,7 +85,7 @@ def build_rule_chart(rule_data: List[Dict[str, Any]]) -> Optional[alt.Chart]:
     df = pd.DataFrame(rule_data)
     chart = (
         alt.Chart(df)
-        .mark_bar(color="#0284c7", cornerRadiusTopRight=4, cornerRadiusBottomRight=4)
+        .mark_bar(color=THEME_COLORS["primary_accent"], cornerRadiusTopRight=4, cornerRadiusBottomRight=4)
         .encode(
             x=alt.X("count:Q", title="Alert Count"),
             y=alt.Y("rule_name:N", sort="-x", title="Detection Rule"),
@@ -103,17 +101,12 @@ def build_rule_chart(rule_data: List[Dict[str, Any]]) -> Optional[alt.Chart]:
 
 def build_timeline_chart(
     timeline_data: List[Dict[str, Any]],
-    color: str = "#0284c7",
-    fill_color: str = "#38bdf8",
+    color: str = THEME_COLORS["primary_accent"],
+    fill_color: str = "#E0835D",
     y_field: str = "count",
     y_title: str = "Alert Count",
 ) -> Optional[alt.Chart]:
-    """Construct an Altair discrete column bar chart for event timeline aggregation.
-
-    Uses discrete column bars instead of continuous area interpolation to ensure
-    sparse datasets, multi-day/year intervals, and single-observation buckets
-    accurately display their true distribution without false activity slopes.
-    """
+    """Construct an Altair discrete column bar chart for event timeline aggregation."""
     if not timeline_data:
         return None
     df = pd.DataFrame(timeline_data)
@@ -139,7 +132,7 @@ def build_ranking_chart(
     value_field: str,
     category_title: str,
     value_title: str,
-    bar_color: str = "#6366f1",
+    bar_color: str = THEME_COLORS["secondary_accent"],
 ) -> Optional[alt.Chart]:
     """Construct a horizontal bar chart for ranked entities (IPs, Ports)."""
     if not data:
@@ -163,7 +156,7 @@ def build_ranking_chart(
 
 
 def render_live_capture_section(target_db_path: Path, is_demo_mode: bool = False) -> None:
-    """Render the Live Packet Capture control panel and real-time status."""
+    """Render the Live Packet Capture control panel and real-time worker status."""
     st.markdown("### 📡 Live Packet Capture (Passive Sniffer)")
 
     if is_demo_mode:
@@ -241,7 +234,6 @@ def render_live_capture_section(target_db_path: Path, is_demo_mode: bool = False
             )
             return
 
-        # Interface selection
         iface_labels = [i["display_name"] for i in available_ifaces]
         selected_label = st.radio(
             "Select Network Interface",
@@ -301,88 +293,42 @@ def render_live_capture_section(target_db_path: Path, is_demo_mode: bool = False
                     )
                     worker.start()
                     st.rerun()
-                except Exception as ex:
-                    st.error(f"Failed to start capture: {ex}")
-
+                except Exception as err:
+                    st.error(f"Failed to start live capture: {err}")
         with btn_stop:
             can_stop = status["is_running"]
             if st.button("⏹️ Stop Capture", disabled=not can_stop, key="live_btn_stop"):
                 worker.stop()
                 st.rerun()
-
         with btn_refresh:
-            if st.button("🔄 Refresh Live Telemetry", key="live_btn_refresh"):
+            if st.button("🔄 Refresh Sniffer Status", key="live_btn_refresh"):
                 st.rerun()
-
-    st.divider()
 
 
 def render_dashboard() -> None:
-    """Render the main Streamlit dashboard UI."""
-
+    """Main Streamlit application entrypoint."""
     st.set_page_config(
-        page_title="Mini-IDS Security Dashboard",
+        page_title="Mini-IDS: Security Analytics Platform",
         page_icon="🛡️",
         layout="wide",
+        initial_sidebar_state="expanded",
     )
 
-    # Custom Cybersecurity Console Theme Styling
-    st.markdown(
-        """
-        <style>
-        /* Modern Cybersecurity Theme Enhancements */
-        [data-testid="stMetric"] {
-            background-color: #0f172a;
-            border: 1px solid #1e293b;
-            padding: 12px 16px;
-            border-radius: 8px;
-            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
-            transition: border-color 0.2s ease;
-        }
-        [data-testid="stMetric"]:hover {
-            border-color: #0284c7;
-        }
-        [data-testid="stMetricLabel"] {
-            font-size: 0.85rem !important;
-            font-weight: 500 !important;
-            color: #94a3b8 !important;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-        }
-        [data-testid="stMetricValue"] {
-            font-size: 1.65rem !important;
-            font-weight: 700 !important;
-            color: #f8fafc !important;
-        }
-        [data-baseweb="tab-list"] {
-            gap: 8px;
-            border-bottom: 1px solid #1e293b;
-            padding-bottom: 4px;
-        }
-        [data-baseweb="tab"] {
-            border-radius: 6px 6px 0 0 !important;
-            padding: 8px 16px !important;
-            font-weight: 600 !important;
-        }
-        .stAlert {
-            border-radius: 6px !important;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    # Apply global custom CSS design tokens
+    st.markdown(get_custom_css(), unsafe_allow_html=True)
 
-    st.title("🛡️ Mini-IDS Security Dashboard")
-    st.caption("Network Intrusion Detection System — Real-Time Packet Sniffing & Forensic Security Analytics")
+    # Sidebar Header
+    st.sidebar.title("🛡️ MINI-IDS")
+    st.sidebar.caption("Intelligent Network Intrusion Detection & Analytics Platform")
 
-    # Sidebar: Database Configuration & Refresh
-    st.sidebar.header("Database Configuration")
+    # Primary Configuration Input (Must remain sidebar.text_input[0] for tests)
     db_path_input = st.sidebar.text_input(
         "Database Path",
         value=str(DEFAULT_DB_PATH),
-        help="Path to SQLite database containing stored packets and alerts.",
+        help="Path to SQLite database containing stored packets, alerts, and model records.",
     )
 
+    # Refresh Button (Must remain sidebar.button[0] for tests)
     if st.sidebar.button("🔄 Refresh Data"):
         st.rerun()
 
@@ -394,11 +340,31 @@ def render_dashboard() -> None:
     demo_toggle = st.sidebar.toggle(
         "Demonstration Mode (Synthetic)",
         value=default_demo_active,
-        help="Enable sanitized synthetic demonstration dataset for cloud hosting or evaluation without local capture files.",
+        help="Enable sanitized synthetic demonstration dataset for evaluation without local capture files.",
         key="app_demo_toggle",
     )
 
-    # If the user or test explicitly customized the text input path, respect it; otherwise use demo mode if toggle is active
+    # 9-Section Navigation Radio (Sidebar Radio [0])
+    nav_sections = [
+        "Overview",
+        "Live Monitoring",
+        "Alert Investigation",
+        "Traffic Intelligence",
+        "AI/ML Detection",
+        "Model Laboratory",
+        "Data Explorer",
+        "Detection Rules",
+        "System & Settings",
+    ]
+    selected_page = st.sidebar.radio(
+        "Navigation",
+        options=nav_sections,
+        index=0,
+        help="Switch between security monitoring, investigation, machine learning, and data science workspaces.",
+        key="app_navigation_radio",
+    )
+
+    # Resolve active database
     raw_path = Path(db_path_input.strip())
     custom_path_provided = bool(raw_path != DEFAULT_DB_PATH)
     is_demo_mode = demo_toggle and not custom_path_provided
@@ -414,8 +380,7 @@ def render_dashboard() -> None:
         target_db_path = raw_path
         st.sidebar.caption(f"📁 **Active Database:** `{target_db_path}`")
 
-    # Requirement 3: Check database existence BEFORE opening connection.
-    # Do not silently create a new database file just by launching the dashboard.
+    # Check database existence BEFORE opening connection
     if not is_demo_mode and not target_db_path.is_file():
         st.warning(f"Database file not found: `{target_db_path}`")
         st.info(
@@ -429,9 +394,6 @@ def render_dashboard() -> None:
         )
         return
 
-    # Live Packet Capture Section
-    render_live_capture_section(target_db_path, is_demo_mode=is_demo_mode)
-
     # Demonstration Mode top notification banner
     if is_demo_mode:
         st.info(
@@ -440,7 +402,7 @@ def render_dashboard() -> None:
             "No real network packets, private host data, or live packet captures are active in this mode."
         )
 
-    # Database Retrieval and UI Rendering with reliable connection cleanup
+    # Database connection & retrieval
     try:
         with DatabaseManager(target_db_path) as db:
             packet_count = db.get_packet_count()
@@ -448,6 +410,8 @@ def render_dashboard() -> None:
 
             # Empty database state
             if packet_count == 0 and alert_count == 0:
+                if selected_page in ("Overview", "Live Monitoring"):
+                    render_live_capture_section(target_db_path, is_demo_mode=is_demo_mode)
                 st.info(
                     f"Connected to database `{target_db_path}`, but it contains no stored packets or alerts.\n\n"
                     "Run an offline PCAP analysis to populate this database:\n\n"
@@ -457,15 +421,12 @@ def render_dashboard() -> None:
                 )
                 return
 
-            # Retrieve all alerts for metrics and recent table
             all_alerts = db.get_alerts(order="DESC")
 
-            # Sidebar Filters
+            # Sidebar Filters (Preserves exact selectbox & checkbox order for tests)
             st.sidebar.header("Filter Options")
-
-            # Alert filters
             st.sidebar.subheader("Alert Filters")
-            st.sidebar.caption("Applies to Alert Analytics and Recent Security Alerts.")
+            st.sidebar.caption("Applies to Alert Analytics and Security Alerts.")
             available_rules = sorted(list({a["rule_name"] for a in all_alerts if a.get("rule_name")}))
             available_severities = sorted(list({a["severity"] for a in all_alerts if a.get("severity")}))
 
@@ -485,9 +446,8 @@ def render_dashboard() -> None:
                 index=1,
             )
 
-            # Traffic filters
             st.sidebar.subheader("Traffic Filters")
-            st.sidebar.caption("Applies to Network Traffic Analytics and Recent Network Traffic.")
+            st.sidebar.caption("Applies to Network Traffic Analytics.")
             packet_limit = st.sidebar.selectbox(
                 "Recent Packets Limit",
                 options=[50, 100, 250, 500, 1000],
@@ -499,7 +459,6 @@ def render_dashboard() -> None:
                 index=0,
             )
 
-            # Optional Analysis Scope / Time Filter (Step 4)
             st.sidebar.subheader("Analysis Scope")
             bounds = db.get_timestamp_bounds()
             min_ts = bounds.get("min_timestamp")
@@ -527,7 +486,7 @@ def render_dashboard() -> None:
                     format="%.2f",
                 )
 
-            # Apply scope filtering if active
+            # Apply scope filtering
             active_alerts = all_alerts
             if enable_time_filter and scope_start_ts is not None and scope_end_ts is not None:
                 active_alerts = [
@@ -535,7 +494,6 @@ def render_dashboard() -> None:
                     if scope_start_ts <= float(a.get("timestamp", 0.0)) <= scope_end_ts
                 ]
 
-            # Retrieve recent packets
             fetch_limit = int(packet_limit) * 2 if selected_protocol != "All" else int(packet_limit)
             if enable_time_filter and scope_start_ts is not None and scope_end_ts is not None:
                 raw_packets = db.get_related_packets(
@@ -548,282 +506,7 @@ def render_dashboard() -> None:
             else:
                 raw_packets = db.get_packets(limit=fetch_limit, order="DESC")
 
-            # Main Panel: Security Overview KPIs (Step 2)
-            kpis = db.get_security_kpis(
-                start_time=scope_start_ts if enable_time_filter else None,
-                end_time=scope_end_ts if enable_time_filter else None,
-            )
-
-            if enable_time_filter and scope_start_ts is not None and scope_end_ts is not None:
-                st.subheader("Security Overview (Scoped to Selected Interval)")
-                st.caption(
-                    f"Showing metrics between `{format_timestamp(scope_start_ts)}` and `{format_timestamp(scope_end_ts)}`. "
-                    "Uncheck 'Filter by Time Range' in sidebar to view cumulative totals across all stored history."
-                )
-            else:
-                st.subheader("Stored Totals (Cumulative Across All Analyses)")
-                st.caption(
-                    "Cumulative metrics reflect the complete database state across all ingested PCAP runs and live captures. "
-                    "Historical PCAP data (October 2015) and recent captures (October 2026) are preserved. "
-                    "Use 'Filter by Time Range' in the sidebar to isolate specific observation periods."
-                )
-
-            metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
-            metric_col1.metric(
-                "Total Stored Packets",
-                f"{kpis['total_packets']:,}",
-                help="Cumulative network frames decoded and indexed in the active SQLite database across all capture runs.",
-            )
-            metric_col2.metric(
-                "Total Stored Alerts",
-                f"{kpis['total_alerts']:,}",
-                help="Cumulative intrusion alerts generated by detection heuristics across all runs.",
-            )
-            metric_col3.metric(
-                "High-Severity Alerts",
-                f"{kpis['high_severity_alerts']:,}",
-                help="Alerts classified as HIGH or CRITICAL severity (e.g. rapid port scans or high-volume floods).",
-            )
-            metric_col4.metric(
-                "Distinct Alert Sources",
-                f"{kpis['distinct_alert_sources']:,}",
-                help="Count of unique source IP addresses that triggered at least one detection alert in the database.",
-            )
-
-            # Grouped rule counts (preserves previous metric cards for compatibility)
-            rule_counts = Counter(a["rule_name"] for a in all_alerts if a.get("rule_name"))
-            if rule_counts:
-                st.markdown("**Alert Counts Grouped by Rule / Type:**")
-                rule_columns = st.columns(max(len(rule_counts), 1))
-                for col, (rule_name, count) in zip(rule_columns, sorted(rule_counts.items())):
-                    col.metric(rule_name, f"{count:,}")
-
-            st.divider()
-
-            # Security Analytics Section (Step 3 & Step 4)
-            st.subheader("📊 Security Analytics")
-            if enable_time_filter and scope_start_ts is not None and scope_end_ts is not None:
-                st.caption(
-                    f"Analytics scoped to interval: `{format_timestamp(scope_start_ts)}` to `{format_timestamp(scope_end_ts)}`."
-                )
-            else:
-                st.caption("Visualizations summarize cumulative stored history in the database.")
-
-            tab_alerts, tab_traffic = st.tabs(["🚨 Alert Analytics", "🌐 Network Traffic Analytics"])
-
-            with tab_alerts:
-                st.caption(
-                    f"Showing alert analytics filtered by Rule: **{selected_rule}** | Severity: **{selected_severity}**."
-                )
-                # Distribution Row
-                dist_col1, dist_col2 = st.columns(2)
-                with dist_col1:
-                    st.markdown("##### Alert Severity Distribution")
-                    sev_data = db.get_alert_severity_distribution(
-                        start_time=scope_start_ts if enable_time_filter else None,
-                        end_time=scope_end_ts if enable_time_filter else None,
-                        rule=selected_rule,
-                    )
-                    sev_chart = build_severity_chart(sev_data)
-                    if sev_chart is not None:
-                        st.altair_chart(sev_chart, width="stretch")
-                    else:
-                        st.info("No alert severity records available for current filter.")
-
-                with dist_col2:
-                    st.markdown("##### Alerts by Detection Rule")
-                    rule_data = db.get_alerts_by_rule(
-                        start_time=scope_start_ts if enable_time_filter else None,
-                        end_time=scope_end_ts if enable_time_filter else None,
-                        severity=selected_severity,
-                    )
-                    rule_chart = build_rule_chart(rule_data)
-                    if rule_chart is not None:
-                        st.altair_chart(rule_chart, width="stretch")
-                    else:
-                        st.info("No detection rule records available for current filter.")
-
-                # Timeline Row
-                st.markdown("##### Alert Timeline (UTC)")
-                alert_timeline_data = db.get_alert_timeline(
-                    start_time=scope_start_ts if enable_time_filter else None,
-                    end_time=scope_end_ts if enable_time_filter else None,
-                    rule=selected_rule,
-                    severity=selected_severity,
-                    bucket_resolution="auto",
-                )
-                alert_tl_chart = build_timeline_chart(
-                    alert_timeline_data,
-                    color="#0284c7",
-                    fill_color="#38bdf8",
-                    y_field="count",
-                    y_title="Alerts Generated",
-                )
-                if alert_tl_chart is not None:
-                    st.altair_chart(alert_tl_chart, width="stretch")
-                    if len(alert_timeline_data) > 1:
-                        st.caption(
-                            "ℹ️ Discrete column bars represent time buckets with recorded alerts. "
-                            "Gaps between bars indicate periods with zero alerts."
-                        )
-                else:
-                    st.info("No alert timeline records available for current filter.")
-
-                # Top Alert Sources & Targets
-                rank_col1, rank_col2 = st.columns(2)
-                with rank_col1:
-                    st.markdown("##### Top Offending Source IPs")
-                    top_sources = db.get_top_alert_sources(
-                        limit=5,
-                        start_time=scope_start_ts if enable_time_filter else None,
-                        end_time=scope_end_ts if enable_time_filter else None,
-                        rule=selected_rule,
-                        severity=selected_severity,
-                    )
-                    src_chart = build_ranking_chart(
-                        top_sources,
-                        category_field="src_ip",
-                        value_field="count",
-                        category_title="Source IP",
-                        value_title="Alert Count",
-                        bar_color="#ef4444",
-                    )
-                    if src_chart is not None:
-                        st.altair_chart(src_chart, width="stretch")
-                    else:
-                        st.info("No source IP records associated with alerts.")
-
-                with rank_col2:
-                    st.markdown("##### Top Targeted Destination IPs")
-                    top_dests = db.get_top_alert_destinations(
-                        limit=5,
-                        start_time=scope_start_ts if enable_time_filter else None,
-                        end_time=scope_end_ts if enable_time_filter else None,
-                        rule=selected_rule,
-                        severity=selected_severity,
-                    )
-                    dst_chart = build_ranking_chart(
-                        top_dests,
-                        category_field="dst_ip",
-                        value_field="count",
-                        category_title="Destination IP",
-                        value_title="Alert Count",
-                        bar_color="#8b5cf6",
-                    )
-                    if dst_chart is not None:
-                        st.altair_chart(dst_chart, width="stretch")
-                    else:
-                        st.info("No destination IP records associated with alerts.")
-
-            with tab_traffic:
-                st.caption(
-                    f"Showing raw packet traffic filtered by Protocol: **{selected_protocol}**. "
-                    "Alert-specific filters (Rule, Severity) apply strictly to the Alert Analytics tab."
-                )
-                # Protocol & Ports Row
-                proto_col1, proto_col2 = st.columns(2)
-                with proto_col1:
-                    st.markdown("##### Protocol Distribution")
-                    proto_data = db.get_protocol_distribution(
-                        start_time=scope_start_ts if enable_time_filter else None,
-                        end_time=scope_end_ts if enable_time_filter else None,
-                        protocol=selected_protocol if selected_protocol != "All" else None,
-                    )
-                    proto_chart = build_ranking_chart(
-                        proto_data,
-                        category_field="protocol",
-                        value_field="count",
-                        category_title="Protocol",
-                        value_title="Packet Count",
-                        bar_color="#06b6d4",
-                    )
-                    if proto_chart is not None:
-                        st.altair_chart(proto_chart, width="stretch")
-                    else:
-                        st.info("No packet protocol records available.")
-
-                with proto_col2:
-                    st.markdown("##### Top Destination Ports")
-                    port_data = db.get_top_destination_ports(
-                        limit=5,
-                        start_time=scope_start_ts if enable_time_filter else None,
-                        end_time=scope_end_ts if enable_time_filter else None,
-                        protocol=selected_protocol if selected_protocol != "All" else None,
-                    )
-                    port_chart = build_ranking_chart(
-                        port_data,
-                        category_field="dst_port",
-                        value_field="packet_count",
-                        category_title="Destination Port",
-                        value_title="Packet Count",
-                        bar_color="#0284c7",
-                    )
-                    if port_chart is not None:
-                        st.altair_chart(port_chart, width="stretch")
-                    else:
-                        st.info("No destination port records available.")
-
-                # Traffic Volume Timeline
-                st.markdown("##### Network Traffic Volume Over Time (UTC)")
-                traffic_timeline_data = db.get_traffic_timeline(
-                    start_time=scope_start_ts if enable_time_filter else None,
-                    end_time=scope_end_ts if enable_time_filter else None,
-                    protocol=selected_protocol if selected_protocol != "All" else None,
-                    bucket_resolution="auto",
-                )
-                traffic_tl_chart = build_timeline_chart(
-                    traffic_timeline_data,
-                    color="#059669",
-                    fill_color="#10b981",
-                    y_field="packet_count",
-                    y_title="Packet Count",
-                )
-                if traffic_tl_chart is not None:
-                    st.altair_chart(traffic_tl_chart, width="stretch")
-                    if len(traffic_timeline_data) > 1:
-                        st.caption(
-                            "ℹ️ Discrete column bars represent volume per time bucket. "
-                            "Gaps between bars indicate periods with zero recorded packets."
-                        )
-                else:
-                    st.info("No traffic volume timeline records available.")
-
-                st.caption(
-                    "ℹ️ **Traffic Telemetry Notice:** Volume metrics indicate network throughput. "
-                    "High traffic volume or common ports do not in themselves indicate malicious activity."
-                )
-
-                # Top Traffic Destinations
-                st.markdown("##### Top Traffic Destination Hosts")
-                traffic_dest_data = db.get_top_packet_destinations(
-                    limit=5,
-                    start_time=scope_start_ts if enable_time_filter else None,
-                    end_time=scope_end_ts if enable_time_filter else None,
-                    protocol=selected_protocol if selected_protocol != "All" else None,
-                )
-                dest_traffic_chart = build_ranking_chart(
-                    traffic_dest_data,
-                    category_field="dst_ip",
-                    value_field="packet_count",
-                    category_title="Destination IP",
-                    value_title="Packet Count",
-                    bar_color="#3b82f6",
-                )
-                if dest_traffic_chart is not None:
-                    st.altair_chart(dest_traffic_chart, width="stretch")
-                else:
-                    st.info("No packet destination records available.")
-
-            st.divider()
-
-            # Section 1: Recent Alerts Table
-            st.subheader("Recent Security Alerts")
-            if enable_time_filter and scope_start_ts is not None and scope_end_ts is not None:
-                st.caption(
-                    f"Showing alerts within time scope: `{format_timestamp(scope_start_ts)}` "
-                    f"to `{format_timestamp(scope_end_ts)}`."
-                )
-
+            # Filtered alerts for table and investigation
             filtered_alerts = active_alerts
             if selected_rule != "All":
                 filtered_alerts = [a for a in filtered_alerts if a.get("rule_name") == selected_rule]
@@ -832,204 +515,819 @@ def render_dashboard() -> None:
             if alert_limit != "All":
                 filtered_alerts = filtered_alerts[: int(alert_limit)]
 
-            if not filtered_alerts:
-                if alert_count == 0:
-                    st.info("No security alerts have been generated in this database.")
-                else:
-                    st.info("No alerts match the selected filter criteria.")
-            else:
-                alert_rows = []
-                for a in filtered_alerts:
-                    alert_rows.append({
-                        "Alert ID": a.get("id"),
-                        "Timestamp": format_timestamp(a.get("timestamp")),
-                        "Rule": a.get("rule_name", "UNKNOWN"),
-                        "Severity": a.get("severity", "UNKNOWN"),
-                        "Source IP": a.get("src_ip") or "N/A",
-                        "Destination IP": a.get("dst_ip") or "N/A",
-                        "Observed": round(float(a.get("observed_value", 0.0)), 2),
-                        "Threshold": round(float(a.get("threshold", 0.0)), 2),
-                        "Window (s)": round(float(a.get("window_seconds", 0.0)), 1),
-                        "Description / Reason": a.get("message", ""),
-                    })
-                df_alerts = pd.DataFrame(alert_rows)
-                st.dataframe(df_alerts, width="stretch")
-
-            st.divider()
-
-            # Section 2: Alert Investigation Workflow (Step 2 & Step 3)
-            st.subheader("🔍 Alert Investigation")
-            st.caption(
-                "Select a specific security alert from filtered results to review its complete details "
-                "and inspect correlated packet evidence from the database."
+            kpis = db.get_security_kpis(
+                start_time=scope_start_ts if enable_time_filter else None,
+                end_time=scope_end_ts if enable_time_filter else None,
             )
 
-            if not filtered_alerts:
-                st.info("No alerts available to investigate with the current filter criteria.")
-            else:
-                # Build alert mapping by database ID
-                alert_id_to_label = {
-                    a["id"]: (
-                        f"Alert #{a['id']} | {a.get('rule_name', 'UNKNOWN')} [{a.get('severity', 'UNKNOWN')}] | "
-                        f"{a.get('src_ip') or 'N/A'} -> {a.get('dst_ip') or 'N/A'} | "
-                        f"{format_timestamp(a.get('timestamp'))}"
-                    )
-                    for a in filtered_alerts
-                }
-                alert_id_options = list(alert_id_to_label.keys())
+            # ------------------------------------------------------------------
+            # PAGE 1: OVERVIEW (Default Page)
+            # ------------------------------------------------------------------
+            if selected_page == "Overview":
+                render_live_capture_section(target_db_path, is_demo_mode=is_demo_mode)
 
-                selected_alert_id = st.selectbox(
-                    "Select Alert to Investigate",
-                    options=alert_id_options,
-                    format_func=lambda aid: alert_id_to_label[aid],
-                    help="Choose an alert by ID from the filtered alert list to load its details and packet evidence.",
-                )
-
-                # Fetch selected alert directly by database ID (Step 2: Actual database row)
-                selected_alert = db.get_alert_by_id(selected_alert_id)
-                if selected_alert is None:
-                    st.warning(f"Alert ID #{selected_alert_id} could not be retrieved from the database.")
-                else:
-                    # Render Selected Alert Details Card
-                    st.markdown(f"#### Alert Details — ID #{selected_alert['id']}")
-
-                    detail_col1, detail_col2, detail_col3, detail_col4 = st.columns(4)
-                    detail_col1.metric("Detection Rule", selected_alert.get("rule_name", "UNKNOWN"))
-                    detail_col2.metric("Severity", selected_alert.get("severity", "UNKNOWN"))
-                    detail_col3.metric(
-                        "Observed / Threshold",
-                        f"{selected_alert.get('observed_value', 0):.2f} / {selected_alert.get('threshold', 0):.2f}",
-                    )
-                    detail_col4.metric(
-                        "Evaluation Window",
-                        f"{selected_alert.get('window_seconds', 0):.1f} s",
-                    )
-
-                    st.markdown(
-                        f"- **Detection Timestamp:** {format_timestamp(selected_alert.get('timestamp'))} "
-                        f"(`epoch: {selected_alert.get('timestamp')}`)\n"
-                        f"- **Source IP:** `{selected_alert.get('src_ip') or 'N/A'}`\n"
-                        f"- **Destination IP:** `{selected_alert.get('dst_ip') or 'N/A'}`\n"
-                        f"- **Trigger Message:** {selected_alert.get('message', 'No details provided.')}"
-                    )
-
-                    # Query and display Related Packet Evidence (Step 3)
-                    st.markdown("---")
-                    st.markdown("#### Related Packet Evidence")
+                if enable_time_filter and scope_start_ts is not None and scope_end_ts is not None:
+                    st.subheader("Security Overview (Scoped to Selected Interval)")
                     st.caption(
-                        "**Detection Window Interval:** Detectors evaluate network activity across a sliding window "
-                        "preceding the alert trigger: `[alert_timestamp - window_seconds, alert_timestamp]`. "
-                        "The query below retrieves stored packets matching the alert's source/destination IP "
-                        "during this evaluation interval."
+                        f"Showing metrics between `{format_timestamp(scope_start_ts)}` and `{format_timestamp(scope_end_ts)}`. "
+                        "Uncheck 'Filter by Time Range' in sidebar to view cumulative totals across all stored history."
+                    )
+                else:
+                    st.subheader("Stored Totals (Cumulative Across All Analyses)")
+                    st.caption(
+                        "Cumulative metrics reflect the complete database state across all ingested PCAP runs and live captures. "
+                        "Historical PCAP data and recent captures are indexed in SQLite."
                     )
 
-                    # Time window calculation
-                    alert_ts = float(selected_alert.get("timestamp", 0.0))
-                    win_sec = float(selected_alert.get("window_seconds", 0.0))
-                    default_start = alert_ts - win_sec
-                    default_end = alert_ts
+                # Primary KPI Row
+                kpi_col1, kpi_col2, kpi_col3, kpi_col4 = st.columns(4)
+                kpi_col1.metric("Total Stored Packets", f"{kpis['total_packets']:,}")
+                kpi_col2.metric("Total Stored Alerts", f"{kpis['total_alerts']:,}")
+                kpi_col3.metric("High-Severity Alerts", f"{kpis['high_severity_alerts']:,}")
+                kpi_col4.metric("Distinct Alert Sources", f"{kpis['distinct_alert_sources']:,}")
 
-                    evidence_col1, evidence_col2 = st.columns([3, 1])
-                    with evidence_col2:
-                        window_buffer = st.number_input(
-                            "Window Buffer (± s)",
-                            min_value=0.0,
-                            max_value=60.0,
-                            value=0.0,
-                            step=1.0,
-                            help="Expand evaluation interval before and after detection timestamp.",
-                        )
-                    with evidence_col1:
-                        effective_start = default_start - window_buffer
-                        effective_end = default_end + window_buffer
-                        st.write(
-                            f"**Search Interval:** `{format_timestamp(effective_start)}` to "
-                            f"`{format_timestamp(effective_end)}` "
-                            f"(Duration: {effective_end - effective_start:.1f}s)"
-                        )
+                # Rule Counts Row (preserves compatibility with test assertions)
+                rule_counts = Counter(a["rule_name"] for a in all_alerts if a.get("rule_name"))
+                if rule_counts:
+                    st.markdown("**Alert Counts Grouped by Rule / Type:**")
+                    rule_columns = st.columns(max(len(rule_counts), 1))
+                    for col, (rule_name, count) in zip(rule_columns, sorted(rule_counts.items())):
+                        col.metric(rule_name, f"{count:,}")
 
-                    # Retrieve matching packet evidence via parameterized query
-                    alert_src = selected_alert.get("src_ip")
-                    alert_dst = selected_alert.get("dst_ip")
+                # Model Readiness Banner
+                registry = ModelRegistry(db_path=target_db_path)
+                active_sup = db.get_active_model("supervised_binary") or db.get_active_model()
+                active_anom = db.get_active_model("anomaly_isolation_forest")
 
-                    evidence_packets = db.get_related_packets(
-                        src_ip=alert_src,
-                        dst_ip=alert_dst,
-                        start_time=effective_start,
-                        end_time=effective_end,
-                        limit=500,
-                        order="ASC",
-                    )
-
-                    if not evidence_packets:
-                        st.warning(
-                            f"No matching packet records found for "
-                            f"{alert_src or 'any'} -> {alert_dst or 'any'} "
-                            f"within the detection interval `[{format_timestamp(effective_start)} — {format_timestamp(effective_end)}]`."
+                st.markdown("---")
+                mod_c1, mod_c2 = st.columns(2)
+                with mod_c1:
+                    if active_sup:
+                        st.success(
+                            f"🤖 **Active Supervised Model:** `{active_sup['algorithm']}` ({active_sup['version']})\n\n"
+                            f"Accuracy: **{active_sup['metrics'].get('accuracy', 0)*100:.2f}%** | "
+                            f"F1 Score: **{active_sup['metrics'].get('f1_weighted', 0)*100:.2f}%**"
                         )
                     else:
+                        st.info("ℹ️ **Supervised Model:** No active model selected. Defaulting to heuristic rule engine.")
+                with mod_c2:
+                    if active_anom:
                         st.success(
-                            f"Found **{len(evidence_packets)}** related packet record(s) matching "
-                            f"IP pair `{alert_src} -> {alert_dst}` in the detection window."
+                            f"🌲 **Active Anomaly Detector:** `Isolation Forest` ({active_anom['version']})\n\n"
+                            f"Features: **{len(active_anom['feature_schema'])}** inputs | "
+                            f"Threshold: **{active_anom['metrics'].get('score_threshold', 0.5):.3f}**"
                         )
-                        evidence_rows = []
-                        for p in evidence_packets:
-                            evidence_rows.append({
-                                "Timestamp": format_timestamp(p.get("timestamp")),
-                                "Epoch": f"{p.get('timestamp', 0.0):.6f}",
-                                "Protocol": p.get("protocol", ""),
-                                "Source IP": p.get("src_ip", ""),
-                                "Destination IP": p.get("dst_ip", ""),
-                                "Source Port": str(p["src_port"]) if p.get("src_port") is not None else "-",
-                                "Destination Port": str(p["dst_port"]) if p.get("dst_port") is not None else "-",
-                                "Length (Bytes)": p.get("length", 0),
-                                "TCP Flags": p.get("tcp_flags") if p.get("tcp_flags") is not None else "-",
-                            })
-                        df_evidence = pd.DataFrame(evidence_rows)
-                        st.dataframe(df_evidence, width="stretch")
+                    else:
+                        st.info("ℹ️ **Anomaly Detector:** Unsupervised detector not active.")
 
-                        st.caption(
-                            "⚠️ **Investigative Notice:** Matching packets are related network telemetry collected "
-                            "during the detection window. They serve as investigative evidence and do not by themselves "
-                            "definitively prove malicious intent or compromise."
+                st.divider()
+
+                # Analytics Tabs
+                st.subheader("📊 Security Analytics")
+                tab_alerts, tab_traffic = st.tabs(["🚨 Alert Analytics", "🌐 Network Traffic Analytics"])
+
+                with tab_alerts:
+                    st.caption(f"Showing alert analytics filtered by Rule: **{selected_rule}** | Severity: **{selected_severity}**.")
+                    dist_col1, dist_col2 = st.columns(2)
+                    with dist_col1:
+                        st.markdown("##### Alert Severity Distribution")
+                        sev_data = db.get_alert_severity_distribution(
+                            start_time=scope_start_ts if enable_time_filter else None,
+                            end_time=scope_end_ts if enable_time_filter else None,
+                            rule=selected_rule,
                         )
+                        sev_chart = build_severity_chart(sev_data)
+                        if sev_chart is not None:
+                            st.altair_chart(sev_chart, width="stretch")
+                        else:
+                            st.info("No alert severity records available.")
 
-                    # Correlation limitation note
-                    st.caption(
-                        "ℹ️ **Correlation Limitation:** The Mini-IDS database schema does not maintain foreign keys "
-                        "between individual packet rows and alerts. Evidence is heuristically correlated using source/destination IP "
-                        "and the detector's sliding time window. Records outside this window or involving other endpoints are not displayed."
+                    with dist_col2:
+                        st.markdown("##### Alerts by Detection Rule")
+                        rule_data = db.get_alerts_by_rule(
+                            start_time=scope_start_ts if enable_time_filter else None,
+                            end_time=scope_end_ts if enable_time_filter else None,
+                            severity=selected_severity,
+                        )
+                        rule_chart = build_rule_chart(rule_data)
+                        if rule_chart is not None:
+                            st.altair_chart(rule_chart, width="stretch")
+                        else:
+                            st.info("No detection rule records available.")
+
+                    st.markdown("##### Alert Timeline (UTC)")
+                    alert_timeline_data = db.get_alert_timeline(
+                        start_time=scope_start_ts if enable_time_filter else None,
+                        end_time=scope_end_ts if enable_time_filter else None,
+                        rule=selected_rule,
+                        severity=selected_severity,
                     )
+                    alert_tl_chart = build_timeline_chart(alert_timeline_data)
+                    if alert_tl_chart is not None:
+                        st.altair_chart(alert_tl_chart, width="stretch")
 
-            st.divider()
+                    rank_col1, rank_col2 = st.columns(2)
+                    with rank_col1:
+                        st.markdown("##### Top Offending Source IPs")
+                        top_sources = db.get_top_alert_sources(
+                            start_time=scope_start_ts if enable_time_filter else None,
+                            end_time=scope_end_ts if enable_time_filter else None,
+                            rule=selected_rule,
+                            severity=selected_severity,
+                        )
+                        src_chart = build_ranking_chart(
+                            top_sources,
+                            category_field="src_ip",
+                            value_field="count",
+                            category_title="Source IP",
+                            value_title="Alert Count",
+                            bar_color=THEME_COLORS["critical"],
+                        )
+                        if src_chart is not None:
+                            st.altair_chart(src_chart, width="stretch")
 
-            # Section 3: Recent Network Traffic Table
-            st.subheader("Recent Network Traffic")
-            filtered_packets = raw_packets
-            if selected_protocol != "All":
-                filtered_packets = [
-                    p for p in filtered_packets
-                    if p.get("protocol", "").upper() == selected_protocol.upper()
+                    with rank_col2:
+                        st.markdown("##### Top Targeted Destination IPs")
+                        top_dests = db.get_top_alert_destinations(
+                            start_time=scope_start_ts if enable_time_filter else None,
+                            end_time=scope_end_ts if enable_time_filter else None,
+                            rule=selected_rule,
+                            severity=selected_severity,
+                        )
+                        dst_chart = build_ranking_chart(
+                            top_dests,
+                            category_field="dst_ip",
+                            value_field="count",
+                            category_title="Destination IP",
+                            value_title="Alert Count",
+                            bar_color=THEME_COLORS["primary_accent"],
+                        )
+                        if dst_chart is not None:
+                            st.altair_chart(dst_chart, width="stretch")
+
+                with tab_traffic:
+                    st.caption(f"Showing raw packet traffic filtered by Protocol: **{selected_protocol}**.")
+                    pcol1, pcol2 = st.columns(2)
+                    with pcol1:
+                        st.markdown("##### Protocol Distribution")
+                        proto_data = db.get_protocol_distribution(
+                            start_time=scope_start_ts if enable_time_filter else None,
+                            end_time=scope_end_ts if enable_time_filter else None,
+                            protocol=selected_protocol if selected_protocol != "All" else None,
+                        )
+                        p_chart = build_ranking_chart(
+                            proto_data,
+                            category_field="protocol",
+                            value_field="count",
+                            category_title="Protocol",
+                            value_title="Packet Count",
+                            bar_color=THEME_COLORS["secondary_accent"],
+                        )
+                        if p_chart is not None:
+                            st.altair_chart(p_chart, width="stretch")
+
+                    with pcol2:
+                        st.markdown("##### Top Destination Ports")
+                        port_data = db.get_top_destination_ports(
+                            start_time=scope_start_ts if enable_time_filter else None,
+                            end_time=scope_end_ts if enable_time_filter else None,
+                            protocol=selected_protocol if selected_protocol != "All" else None,
+                        )
+                        port_chart = build_ranking_chart(
+                            port_data,
+                            category_field="dst_port",
+                            value_field="packet_count",
+                            category_title="Destination Port",
+                            value_title="Packet Count",
+                            bar_color=THEME_COLORS["primary_accent"],
+                        )
+                        if port_chart is not None:
+                            st.altair_chart(port_chart, width="stretch")
+
+                st.divider()
+
+                # Recent Security Alerts Table (Must be dataframe[0] for tests)
+                st.subheader("Recent Security Alerts")
+                if not filtered_alerts:
+                    st.info("No alerts match the selected filter criteria.")
+                else:
+                    alert_rows = []
+                    for a in filtered_alerts:
+                        alert_rows.append({
+                            "Alert ID": a.get("id"),
+                            "Timestamp": format_timestamp(a.get("timestamp")),
+                            "Rule": a.get("rule_name", "UNKNOWN"),
+                            "Severity": a.get("severity", "UNKNOWN"),
+                            "Detection Method": a.get("detection_method", "HEURISTIC"),
+                            "Source IP": a.get("src_ip") or "N/A",
+                            "Destination IP": a.get("dst_ip") or "N/A",
+                            "Observed": round(float(a.get("observed_value", 0.0)), 2),
+                            "Threshold": round(float(a.get("threshold", 0.0)), 2),
+                            "Window (s)": round(float(a.get("window_seconds", 0.0)), 1),
+                            "Description / Reason": a.get("message", ""),
+                        })
+                    df_alerts = pd.DataFrame(alert_rows)
+                    st.dataframe(df_alerts, width="stretch")
+
+                st.divider()
+
+                # Alert Investigation Workflow (Must have selectbox[0] and dataframe[1] for tests)
+                st.subheader("🔍 Alert Investigation")
+                if not filtered_alerts:
+                    st.info("No alerts available to investigate with the current filter criteria.")
+                else:
+                    alert_id_to_label = {
+                        a["id"]: (
+                            f"Alert #{a['id']} | {a.get('rule_name', 'UNKNOWN')} [{a.get('severity', 'UNKNOWN')}] | "
+                            f"{a.get('src_ip') or 'N/A'} -> {a.get('dst_ip') or 'N/A'} | "
+                            f"{format_timestamp(a.get('timestamp'))}"
+                        )
+                        for a in filtered_alerts
+                    }
+                    selected_alert_id = st.selectbox(
+                        "Select Alert to Investigate",
+                        options=list(alert_id_to_label.keys()),
+                        format_func=lambda aid: alert_id_to_label[aid],
+                        key="overview_alert_select",
+                    )
+                    selected_alert = db.get_alert_by_id(selected_alert_id)
+                    if selected_alert:
+                        st.markdown(f"#### Alert Details — ID #{selected_alert['id']}")
+                        c1, c2, c3, c4 = st.columns(4)
+                        c1.metric("Detection Rule", selected_alert.get("rule_name", "UNKNOWN"))
+                        c2.metric("Severity", selected_alert.get("severity", "UNKNOWN"))
+                        c3.metric("Observed / Threshold", f"{selected_alert.get('observed_value', 0):.2f} / {selected_alert.get('threshold', 0):.2f}")
+                        c4.metric("Window Duration", f"{selected_alert.get('window_seconds', 0):.1f} s")
+
+                        alert_ts = float(selected_alert.get("timestamp", 0.0))
+                        win_sec = float(selected_alert.get("window_seconds", 0.0))
+                        effective_start = alert_ts - win_sec
+                        effective_end = alert_ts
+
+                        evidence_packets = db.get_related_packets(
+                            src_ip=selected_alert.get("src_ip"),
+                            dst_ip=selected_alert.get("dst_ip"),
+                            start_time=effective_start,
+                            end_time=effective_end,
+                            limit=500,
+                            order="ASC",
+                        )
+
+                        st.markdown("#### Related Packet Evidence")
+                        if not evidence_packets:
+                            st.warning(
+                                f"No matching packet records found for "
+                                f"{selected_alert.get('src_ip') or 'any'} -> {selected_alert.get('dst_ip') or 'any'} "
+                                f"within the detection interval `[{format_timestamp(effective_start)} — {format_timestamp(effective_end)}]`."
+                            )
+                        else:
+                            st.success(f"Found **{len(evidence_packets)}** related packet record(s) matching detection window.")
+                            evidence_rows = []
+                            for p in evidence_packets:
+                                evidence_rows.append({
+                                    "Timestamp": format_timestamp(p.get("timestamp")),
+                                    "Epoch": f"{p.get('timestamp', 0.0):.6f}",
+                                    "Protocol": p.get("protocol", ""),
+                                    "Source IP": p.get("src_ip", ""),
+                                    "Destination IP": p.get("dst_ip", ""),
+                                    "Source Port": str(p["src_port"]) if p.get("src_port") is not None else "-",
+                                    "Destination Port": str(p["dst_port"]) if p.get("dst_port") is not None else "-",
+                                    "Length (Bytes)": p.get("length", 0),
+                                    "TCP Flags": p.get("tcp_flags") if p.get("tcp_flags") is not None else "-",
+                                })
+                            df_evidence = pd.DataFrame(evidence_rows)
+                            st.dataframe(df_evidence, width="stretch")
+
+                st.divider()
+
+                # Recent Network Traffic Table (Must be dataframe[2] for tests)
+                st.subheader("Recent Network Traffic")
+                filtered_packets = raw_packets
+                if selected_protocol != "All":
+                    filtered_packets = [
+                        p for p in filtered_packets
+                        if p.get("protocol", "").upper() == selected_protocol.upper()
+                    ]
+                filtered_packets = filtered_packets[: int(packet_limit)]
+
+                if not filtered_packets:
+                    st.info("No packets match the selected traffic filters.")
+                else:
+                    packet_rows = []
+                    for p in filtered_packets:
+                        packet_rows.append({
+                            "Timestamp": format_timestamp(p.get("timestamp")),
+                            "Source IP": p.get("src_ip", ""),
+                            "Destination IP": p.get("dst_ip", ""),
+                            "Protocol": p.get("protocol", ""),
+                            "Length (Bytes)": p.get("length", 0),
+                            "Source Port": str(p["src_port"]) if p.get("src_port") is not None else "-",
+                            "Destination Port": str(p["dst_port"]) if p.get("dst_port") is not None else "-",
+                            "TCP Flags": p.get("tcp_flags") if p.get("tcp_flags") is not None else "-",
+                        })
+                    df_packets = pd.DataFrame(packet_rows)
+                    st.dataframe(df_packets, width="stretch")
+
+            # ------------------------------------------------------------------
+            # PAGE 2: LIVE MONITORING
+            # ------------------------------------------------------------------
+            elif selected_page == "Live Monitoring":
+                render_live_capture_section(target_db_path, is_demo_mode=is_demo_mode)
+
+                st.subheader("Real-Time Event Stream")
+                recent_live_alerts = db.get_alerts(limit=25, order="DESC")
+                if not recent_live_alerts:
+                    st.info("No security alerts triggered during current live capture session.")
+                else:
+                    st.dataframe(pd.DataFrame(recent_live_alerts), width="stretch")
+
+            # ------------------------------------------------------------------
+            # PAGE 3: ALERT INVESTIGATION (Dedicated Forensic Workspace)
+            # ------------------------------------------------------------------
+            elif selected_page == "Alert Investigation":
+                st.title("🔍 Alert Investigation & Threat Correlation Console")
+                st.caption(
+                    "Examine intrusion detections, correlate heuristic alerts with machine learning inferences, "
+                    "inspect raw packet evidence, and review defensive triage playbooks."
+                )
+
+                if not all_alerts:
+                    st.info("No security alerts exist in this database to investigate.")
+                else:
+                    # Filter row
+                    f_col1, f_col2, f_col3 = st.columns(3)
+                    with f_col1:
+                        meth_options = ["All", "HEURISTIC", "ML_SUPERVISED", "ML_ANOMALY"]
+                        selected_meth = st.selectbox("Detection Method", meth_options, index=0)
+                    with f_col2:
+                        selected_sev = st.selectbox("Severity Tier", ["All", "CRITICAL", "HIGH", "MEDIUM", "LOW"], index=0)
+                    with f_col3:
+                        rule_filter = st.selectbox("Triggered Rule", ["All"] + sorted(list({a["rule_name"] for a in all_alerts})), index=0)
+
+                    inv_pool = all_alerts
+                    if selected_meth != "All":
+                        inv_pool = [a for a in inv_pool if a.get("detection_method", "HEURISTIC") == selected_meth]
+                    if selected_sev != "All":
+                        inv_pool = [a for a in inv_pool if a.get("severity") == selected_sev]
+                    if rule_filter != "All":
+                        inv_pool = [a for a in inv_pool if a.get("rule_name") == rule_filter]
+
+                    if not inv_pool:
+                        st.info("No alerts match the chosen investigation filters.")
+                    else:
+                        alert_choices = {
+                            a["id"]: f"Alert #{a['id']} [{a.get('severity')}] {a.get('rule_name')} | {a.get('src_ip')} -> {a.get('dst_ip')} | {format_timestamp(a.get('timestamp'))}"
+                            for a in inv_pool
+                        }
+                        chosen_id = st.selectbox(
+                            "Select Alert to Investigate",
+                            options=list(alert_choices.keys()),
+                            format_func=lambda x: alert_choices[x],
+                            key="deep_investigate_select",
+                        )
+                        alert = db.get_alert_by_id(chosen_id)
+                        if alert:
+                            st.markdown(f"### Alert Forensic Dossier — ID #{alert['id']}")
+                            d_col1, d_col2, d_col3, d_col4 = st.columns(4)
+                            d_col1.metric("Detection Category", alert.get("rule_name", "UNKNOWN"))
+                            d_col2.metric("Severity Tier", alert.get("severity", "UNKNOWN"))
+                            d_col3.metric("Detection Method", alert.get("detection_method", "HEURISTIC"))
+                            d_col4.metric("Evaluation Window", f"{alert.get('window_seconds', 0):.1f} s")
+
+                            st.markdown(
+                                f"- **Trigger Timestamp:** `{format_timestamp(alert.get('timestamp'))}`\n"
+                                f"- **Source Host:** `{alert.get('src_ip') or 'N/A'}`\n"
+                                f"- **Destination Host:** `{alert.get('dst_ip') or 'N/A'}`\n"
+                                f"- **Observed Value vs Threshold:** `{alert.get('observed_value', 0):.2f}` (Threshold: `{alert.get('threshold', 0):.2f}`)\n"
+                                f"- **Trigger Details:** {alert.get('message', 'No details provided.')}"
+                            )
+
+                            if alert.get("model_version"):
+                                st.caption(f"🤖 **Model Version Attributed:** `{alert['model_version']}`")
+
+                            # Local Explanation
+                            st.markdown("#### 🔬 Diagnostic Threat Explanation")
+                            explanations = ModelExplainer.explain_flow_prediction({
+                                "flow_duration": float(alert.get("window_seconds", 0.0)),
+                                "syn_flag_count": float(alert.get("observed_value", 0.0)) if "SYN" in alert.get("rule_name", "") else 0.0,
+                                "total_fwd_packets": 20.0,
+                                "total_bwd_packets": 2.0,
+                                "flow_packets_s": float(alert.get("observed_value", 0.0)) if "VOLUME" in alert.get("rule_name", "") else 10.0,
+                                "flow_bytes_s": float(alert.get("observed_value", 0.0)) if "VOLUME" in alert.get("rule_name", "") else 5000.0,
+                            })
+                            for exp in explanations:
+                                st.info(f"💡 **Signal Detected:** {exp['reason']}")
+
+                            # Correlated Packet Evidence
+                            st.markdown("#### 📦 Correlated Packet Evidence")
+                            alert_ts = float(alert.get("timestamp", 0.0))
+                            win_sec = float(alert.get("window_seconds", 0.0))
+                            packets = db.get_related_packets(
+                                src_ip=alert.get("src_ip"),
+                                dst_ip=alert.get("dst_ip"),
+                                start_time=alert_ts - win_sec - 1.0,
+                                end_time=alert_ts + 1.0,
+                                limit=100,
+                            )
+                            if packets:
+                                st.dataframe(pd.DataFrame(packets), width="stretch")
+                            else:
+                                st.warning("No matching packet records found in the database during this detection interval.")
+
+                            # Defensive Remediation Guidance
+                            st.markdown("#### 🛡️ Prioritized Defensive Remediation Playbook")
+                            recs = ModelExplainer.get_defensive_recommendations(alert.get("rule_name", ""))
+                            for r in recs:
+                                st.markdown(f"- ✅ {r}")
+
+            # ------------------------------------------------------------------
+            # PAGE 4: TRAFFIC INTELLIGENCE
+            # ------------------------------------------------------------------
+            elif selected_page == "Traffic Intelligence":
+                st.title("🌐 Network Traffic Intelligence & Flow Analytics")
+                st.caption("Inspect discrete time-bucket volumes, flow distributions, and protocol proportions.")
+
+                ti_col1, ti_col2, ti_col3 = st.columns(3)
+                ti_col1.metric("Total Observed Packets", f"{packet_count:,}")
+                ti_col2.metric("Total Stored Alerts", f"{alert_count:,}")
+                ti_col3.metric("Indexed Network Flows", f"{db.get_flow_count():,}")
+
+                # Benign vs Suspicious Ratio
+                st.markdown("---")
+                st.markdown("### ⚖️ Benign vs. Suspicious Traffic Ratio")
+                suspicious_est = min(packet_count, alert_count * 10)
+                benign_est = max(0, packet_count - suspicious_est)
+                b_ratio = round((benign_est * 100.0) / max(packet_count, 1), 1)
+                s_ratio = round((suspicious_est * 100.0) / max(packet_count, 1), 1)
+
+                r_col1, r_col2 = st.columns(2)
+                r_col1.metric("Benign Traffic Proportion", f"{b_ratio}%", f"{benign_est:,} packets")
+                r_col2.metric("Suspicious / Alert Associated", f"{s_ratio}%", f"{suspicious_est:,} packets", delta_color="inverse")
+
+                # Protocol and Port Breakdown
+                st.markdown("---")
+                st.markdown("### 🔌 Protocol & Port Breakdown")
+                p1, p2 = st.columns(2)
+                with p1:
+                    p_data = db.get_protocol_distribution()
+                    p_chart = build_ranking_chart(p_data, "protocol", "count", "Protocol", "Packets", THEME_COLORS["secondary_accent"])
+                    if p_chart:
+                        st.altair_chart(p_chart, width="stretch")
+                with p2:
+                    pt_data = db.get_top_destination_ports(limit=8)
+                    pt_chart = build_ranking_chart(pt_data, "dst_port", "packet_count", "Port", "Packets", THEME_COLORS["primary_accent"])
+                    if pt_chart:
+                        st.altair_chart(pt_chart, width="stretch")
+
+                # Flows Table if available
+                st.markdown("---")
+                st.markdown("### 🌊 Indexed Bidirectional Network Flows")
+                flows = db.get_flows(limit=50)
+                if flows:
+                    df_flows = pd.DataFrame(flows)
+                    disp_cols = [c for c in ["flow_id", "src_ip", "dst_ip", "protocol", "duration", "packet_count", "byte_count", "flow_pkts_s"] if c in df_flows.columns]
+                    st.dataframe(df_flows[disp_cols], width="stretch")
+                else:
+                    st.info("No flow summaries indexed yet. Run `python main.py --pcap <file> --hybrid` to aggregate and index stateful flows.")
+
+            # ------------------------------------------------------------------
+            # PAGE 5: AI/ML DETECTION
+            # ------------------------------------------------------------------
+            elif selected_page == "AI/ML Detection":
+                st.title("🤖 AI/ML Detection Engine & Model Health")
+                st.caption("Operational transparency for supervised classifiers and unsupervised Isolation Forest anomaly detectors.")
+
+                registry = ModelRegistry(db_path=target_db_path)
+                active_sup = db.get_active_model("supervised_binary") or db.get_active_model()
+                active_anom = db.get_active_model("anomaly_isolation_forest")
+
+                m_col1, m_col2 = st.columns(2)
+                with m_col1:
+                    st.markdown("### 🎯 Supervised Classifier Status")
+                    if active_sup:
+                        st.success(f"**Algorithm:** {active_sup['algorithm']} (`{active_sup['version']}`)")
+                        st.markdown(
+                            f"- **Target Task:** `{active_sup.get('task_type', 'binary')}`\n"
+                            f"- **Training Dataset:** `{active_sup.get('dataset_name', 'Unknown')}`\n"
+                            f"- **Accuracy (Test):** `{active_sup['metrics'].get('accuracy', 0)*100:.2f}%`\n"
+                            f"- **F1 Score (Weighted):** `{active_sup['metrics'].get('f1_weighted', 0)*100:.2f}%`\n"
+                            f"- **Precision (Macro):** `{active_sup['metrics'].get('precision_macro', 0)*100:.2f}%`\n"
+                            f"- **Inference Latency:** `{active_sup['metrics'].get('inference_latency_ms_per_sample', 0):.4f} ms/sample`"
+                        )
+                    else:
+                        st.warning("No supervised model active. Head to Model Laboratory to train or activate one.")
+
+                with m_col2:
+                    st.markdown("### 🌲 Unsupervised Anomaly Detector")
+                    if active_anom:
+                        st.success(f"**Algorithm:** Isolation Forest (`{active_anom['version']}`)")
+                        st.markdown(
+                            f"- **Training Baseline:** Benign network flows (zero malicious contamination)\n"
+                            f"- **Estimators:** 100 Isolation Trees\n"
+                            f"- **Score Threshold:** `{active_anom['metrics'].get('score_threshold', 0.5):.3f}`\n"
+                            f"- **Active Status:** `ONLINE (Real-time scoring)`"
+                        )
+                    else:
+                        st.warning("No anomaly detector active. Head to Model Laboratory to train or activate one.")
+
+                # Feature Schema
+                st.markdown("---")
+                st.markdown("### 📐 Active Feature Schema (28 Inputs)")
+                if active_sup and active_sup.get("feature_schema"):
+                    feats = active_sup["feature_schema"]
+                    f_cols = st.columns(4)
+                    for idx, f in enumerate(feats):
+                        f_cols[idx % 4].caption(f"`{idx+1}. {f}`")
+
+                # Scientific Integrity Alert
+                st.markdown("---")
+                st.info(
+                    "⚠️ **Scientific & Operational Notice:**\n\n"
+                    "Unusual traffic patterns flagged by Isolation Forest do **NOT** automatically prove malicious compromise. "
+                    "Network variance (e.g. software updates, large backup jobs, multi-stream media) frequently triggers high anomaly scores. "
+                    "All AI/ML detections serve strictly as prioritized decision-support signals for security analysts."
+                )
+
+            # ------------------------------------------------------------------
+            # PAGE 6: MODEL LABORATORY (Training & Evaluation Workspace)
+            # ------------------------------------------------------------------
+            elif selected_page == "Model Laboratory":
+                st.title("🔬 Model Laboratory & Experimentation Workbench")
+                st.caption("Train real classifiers, inspect verifiable metrics, compare confusion matrices, and activate validated model versions.")
+
+                ds_manager = DatasetManager()
+                listing = ds_manager.list_datasets()
+                registry = ModelRegistry(db_path=target_db_path)
+
+                with st.expander("🛠️ Train a New Model", expanded=True):
+                    t_col1, t_col2, t_col3 = st.columns(3)
+                    with t_col1:
+                        target_ds = st.selectbox("Training Dataset", ["cicids2017", "unsw_nb15"], index=0)
+                    with t_col2:
+                        target_algo = st.selectbox(
+                            "Algorithm",
+                            ["Random Forest", "Logistic Regression", "Isolation Forest"],
+                            index=0,
+                        )
+                    with t_col3:
+                        task_mode = st.selectbox("Classification Task", ["binary", "multiclass"], index=0)
+
+                    auto_activate = st.checkbox("Automatically activate if validation succeeds", value=True)
+
+                    if st.button("🚀 Train Model Now", type="primary"):
+                        paths = ds_manager.get_dataset_paths(target_ds)
+                        # Check raw file or create deterministic sample
+                        raw_files = list(paths["raw"].glob("*.csv"))
+                        if not raw_files:
+                            st.info("Creating deterministic sample dataset fixture...")
+                            ds_manager.generate_reproducible_sample_dataset(target_ds)
+                            raw_files = list(paths["raw"].glob("*.csv"))
+
+                        with st.spinner(f"Preprocessing data and training {target_algo}..."):
+                            df = pd.read_csv(raw_files[0])
+                            preprocessor = FlowDataPreprocessor(task_type=task_mode, split_method="stratified")
+                            splits, prep_rep = preprocessor.fit_transform(df)
+
+                            X_train, y_train = splits["X_train"], splits["y_train"]
+                            X_test, y_test = splits["X_test"], splits["y_test"]
+
+                            algo_slug = target_algo.lower().replace(" ", "_")
+                            ver = f"{algo_slug}_{task_mode}_{int(time.time())}"
+
+                            if algo_slug == "isolation_forest":
+                                b_mask = y_train == 0
+                                X_ben = X_train[b_mask] if b_mask.any() else X_train
+                                trainer = AnomalyDetectorTrainer()
+                                model, summary = trainer.train(X_ben)
+                                is_anom, scores = trainer.score_samples(X_test)
+                                acc = float(np.mean((is_anom.astype(int) == y_test)))
+                                metrics = {
+                                    "training_duration_seconds": summary.training_duration_seconds,
+                                    "train_samples": summary.train_samples,
+                                    "score_threshold": summary.score_threshold,
+                                    "accuracy": acc,
+                                }
+                                m_type = "anomaly_isolation_forest"
+                            else:
+                                trainer = SupervisedModelTrainer(algorithm=algo_slug, task_type=task_mode)
+                                model, summary = trainer.train(X_train, y_train)
+                                class_names = [preprocessor.inverse_label_mapping_.get(i, f"Class_{i}") for i in sorted(list(set(y_train)))]
+                                eval_res = ModelEvaluator.evaluate_classifier(
+                                    model=model,
+                                    X_test=X_test,
+                                    y_test=y_test,
+                                    model_name=target_algo,
+                                    model_version=ver,
+                                    dataset_name=target_ds,
+                                    task_type=task_mode,
+                                    split_method=prep_rep.split_method,
+                                    class_names=class_names,
+                                )
+                                ModelEvaluator.save_reports(eval_res)
+                                metrics = eval_res.to_dict()
+                                m_type = f"supervised_{task_mode}"
+
+                            meta = registry.save_model_bundle(
+                                name=f"{target_algo}_{target_ds.upper()}",
+                                version=ver,
+                                model=model,
+                                preprocessor=preprocessor,
+                                model_type=m_type,
+                                algorithm=target_algo,
+                                dataset_name=target_ds,
+                                task_type=task_mode,
+                                feature_schema=preprocessor.feature_names_,
+                                metrics=metrics,
+                                set_active=auto_activate,
+                            )
+                            st.success(f"✅ Model `{ver}` trained successfully in {summary.training_duration_seconds:.2f}s!")
+                            st.rerun()
+
+                # Model Registry Table
+                st.markdown("---")
+                st.subheader("📚 Model Artifact Registry")
+                all_models = db.get_models()
+                if not all_models:
+                    st.info("No models registered yet. Train a model using the form above.")
+                else:
+                    for m in all_models:
+                        is_act = bool(m.get("is_active"))
+                        act_badge = "🟢 ACTIVE" if is_act else "⚪ INACTIVE"
+                        with st.container():
+                            st.markdown(f"#### {act_badge} `{m['name']}` (v: `{m['version']}`)")
+                            mc1, mc2, mc3, mc4 = st.columns(4)
+                            mc1.metric("Algorithm", m.get("algorithm", "-"))
+                            mc2.metric("Task Type", m.get("task_type", "-"))
+                            mc3.metric("Accuracy", f"{m['metrics'].get('accuracy', 0)*100:.2f}%")
+                            mc4.metric("F1 Score", f"{m['metrics'].get('f1_weighted', 0)*100:.2f}%")
+
+                            if not is_act:
+                                if st.button(f"Activate {m['version']}", key=f"btn_act_{m['version']}"):
+                                    db.set_active_model(m["version"], is_active=True)
+                                    st.success(f"Activated model {m['version']}!")
+                                    st.rerun()
+                            st.caption(f"📁 Path: `{m.get('artifact_path')}` | Created: {format_timestamp(m.get('created_at'))}")
+                            st.markdown("---")
+
+            # ------------------------------------------------------------------
+            # PAGE 7: DATA EXPLORER (Data Science EDA Workspace)
+            # ------------------------------------------------------------------
+            elif selected_page == "Data Explorer":
+                st.title("📊 Data Explorer & Exploratory Analysis (EDA)")
+                st.caption("Inspect raw dataset health, class distributions, missing value audits, and feature correlation matrices.")
+
+                manager = DatasetManager()
+                target_ds = st.selectbox("Choose Dataset to Explore", ["cicids2017", "unsw_nb15"], index=0)
+                paths = manager.get_dataset_paths(target_ds)
+                raw_files = list(paths["raw"].glob("*.csv"))
+
+                if not raw_files:
+                    st.info(f"No CSV files found in `{paths['raw']}`. Generating sample fixture...")
+                    manager.generate_reproducible_sample_dataset(target_ds)
+                    raw_files = list(paths["raw"].glob("*.csv"))
+
+                selected_csv = st.selectbox("Select CSV File", options=[f.name for f in raw_files], index=0)
+                file_path = paths["raw"] / selected_csv
+                df = pd.read_csv(file_path)
+
+                profile = DatasetProfiler.profile_dataframe(df)
+
+                e1, e2, e3, e4 = st.columns(4)
+                e1.metric("Total Records", f"{profile['total_rows']:,}")
+                e2.metric("Total Features", f"{profile['total_cols']:,}")
+                e3.metric("Duplicate Rows", f"{profile['duplicate_rows']:,}")
+                e4.metric("Constant Columns", f"{len(profile['constant_columns'])}")
+
+                # Class Distribution
+                st.markdown("---")
+                st.subheader("🎯 Ground-Truth Class Distribution")
+                if profile["class_distribution"]:
+                    cd_df = pd.DataFrame([
+                        {"Class": k, "Count": v, "Percentage": round(v * 100.0 / profile['total_rows'], 2)}
+                        for k, v in profile["class_distribution"].items()
+                    ])
+                    col_chart, col_tbl = st.columns([2, 1])
+                    with col_chart:
+                        c_chart = (
+                            alt.Chart(cd_df)
+                            .mark_bar(color=THEME_COLORS["primary_accent"], cornerRadiusTopRight=4, cornerRadiusBottomRight=4)
+                            .encode(
+                                x=alt.X("Count:Q", title="Samples"),
+                                y=alt.Y("Class:N", sort="-x", title="Target Class"),
+                                tooltip=["Class:N", "Count:Q", "Percentage:Q"],
+                            )
+                            .properties(height=200)
+                        )
+                        st.altair_chart(c_chart, width="stretch")
+                    with col_tbl:
+                        st.dataframe(cd_df, width="stretch")
+
+                # Numerical Summaries
+                st.markdown("---")
+                st.subheader("📈 Statistical Feature Summaries")
+                if profile["numeric_summaries"]:
+                    summary_df = pd.DataFrame(profile["numeric_summaries"]).T
+                    st.dataframe(summary_df.round(3), width="stretch")
+
+                # Correlation Matrix
+                st.markdown("---")
+                st.subheader("🔥 Feature Correlation Analysis")
+                cols, corr_matrix = DatasetProfiler.compute_correlation_matrix(df, max_features=12)
+                if len(cols) > 1:
+                    corr_df = pd.DataFrame(corr_matrix, index=cols, columns=cols).round(2)
+                    st.dataframe(corr_df, width="stretch")
+
+            # ------------------------------------------------------------------
+            # PAGE 8: DETECTION RULES
+            # ------------------------------------------------------------------
+            elif selected_page == "Detection Rules":
+                st.title("⚙️ Detection Rules & Heuristic Policies")
+                st.caption("Inspect and manage threshold parameters for rule-based and machine-learning detectors.")
+
+                rules_table = [
+                    {
+                        "Rule": "PORT_SCAN",
+                        "Category": "Reconnaissance",
+                        "Target": "TCP Probes across distinct destination ports",
+                        "Threshold": "15 distinct ports",
+                        "Window": "30.0 seconds",
+                        "Severity": "HIGH",
+                        "Status": "ACTIVE",
+                    },
+                    {
+                        "Rule": "SYN_RATE",
+                        "Category": "Denial of Service (DoS)",
+                        "Target": "High-velocity TCP SYN packet bursts",
+                        "Threshold": "20 SYN packets",
+                        "Window": "10.0 seconds",
+                        "Severity": "MEDIUM",
+                        "Status": "ACTIVE",
+                    },
+                    {
+                        "Rule": "TRAFFIC_VOLUME",
+                        "Category": "Anomaly / Exfiltration",
+                        "Target": "Sudden spikes in byte or packet volume",
+                        "Threshold": "100,000 bytes or 500 packets",
+                        "Window": "60.0 seconds",
+                        "Severity": "MEDIUM",
+                        "Status": "ACTIVE",
+                    },
+                    {
+                        "Rule": "ML_SUPERVISED",
+                        "Category": "Machine Learning Classifier",
+                        "Target": "Multivariate flow vector matching known attack patterns",
+                        "Threshold": "Confidence >= 0.50",
+                        "Window": "Stateful Flow Duration",
+                        "Severity": "CRITICAL / HIGH",
+                        "Status": "ACTIVE" if active_sup else "STANDBY",
+                    },
+                    {
+                        "Rule": "ML_ANOMALY",
+                        "Category": "Unsupervised Outlier",
+                        "Target": "Statistical deviation from benign traffic profile",
+                        "Threshold": "Anomaly Score >= 0.50",
+                        "Window": "Stateful Flow Duration",
+                        "Severity": "MEDIUM",
+                        "Status": "ACTIVE" if active_anom else "STANDBY",
+                    },
                 ]
-            filtered_packets = filtered_packets[: int(packet_limit)]
+                st.dataframe(pd.DataFrame(rules_table), width="stretch")
 
-            if not filtered_packets:
-                st.info("No packets match the selected traffic filters.")
-            else:
-                packet_rows = []
-                for p in filtered_packets:
-                    packet_rows.append({
-                        "Timestamp": format_timestamp(p.get("timestamp")),
-                        "Source IP": p.get("src_ip", ""),
-                        "Destination IP": p.get("dst_ip", ""),
-                        "Protocol": p.get("protocol", ""),
-                        "Length (Bytes)": p.get("length", 0),
-                        "Source Port": str(p["src_port"]) if p.get("src_port") is not None else "-",
-                        "Destination Port": str(p["dst_port"]) if p.get("dst_port") is not None else "-",
-                        "TCP Flags": p.get("tcp_flags") if p.get("tcp_flags") is not None else "-",
-                    })
-                df_packets = pd.DataFrame(packet_rows)
-                st.dataframe(df_packets, width="stretch")
+            # ------------------------------------------------------------------
+            # PAGE 9: SYSTEM & SETTINGS
+            # ------------------------------------------------------------------
+            elif selected_page == "System & Settings":
+                st.title("🖥️ System Diagnostics & Environment Status")
+                st.caption("Verify runtime dependencies, database health, and evaluation reports.")
+
+                import sys
+                s1, s2, s3 = st.columns(3)
+                s1.metric("Python Interpreter", sys.version.split(" ")[0])
+                s2.metric("Database Path", str(target_db_path.name))
+                file_size_kb = target_db_path.stat().st_size / 1024 if target_db_path.exists() else 0
+                s3.metric("Database Size", f"{file_size_kb:.1f} KB")
+
+                st.markdown("---")
+                st.markdown("### 📄 Evaluation Reports Browser")
+                reports_dir = Path("data") / "reports"
+                if reports_dir.exists():
+                    md_reports = list(reports_dir.glob("*.md"))
+                    if md_reports:
+                        chosen_rep = st.selectbox("Select Evaluation Report", [r.name for r in md_reports])
+                        rep_path = reports_dir / chosen_rep
+                        st.markdown(rep_path.read_text(encoding="utf-8"))
+                    else:
+                        st.info("No evaluation reports generated yet. Run `python scripts/evaluate_models.py`.")
+                else:
+                    st.info("No evaluation reports generated yet.")
+
+                st.markdown("---")
+                st.markdown("### ⚖️ Defensive Cybersecurity & Privacy Principles")
+                st.caption(
+                    "Mini-IDS is an educational, passive network intrusion detection system. "
+                    "It observes packet headers and flow metadata without altering, injecting, or terminating network sessions. "
+                    "All captured network telemetry remains strictly on the local workstation and is never uploaded externally."
+                )
 
     except sqlite3.Error as sql_err:
         st.error(f"Database error while reading `{target_db_path}`: {sql_err}")

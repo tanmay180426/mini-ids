@@ -66,3 +66,14 @@ $RECYCLE.BIN/
 scratch/
 .system_generated/
 .agents/
+
+# Machine Learning Models and Large Datasets
+*.joblib
+*.pkl
+*.parquet
+data/datasets/*/raw/*
+data/datasets/*/processed/*
+!data/datasets/**/metadata/
+!data/datasets/**/metadata/*
+!data/sample/*
+

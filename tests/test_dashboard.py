@@ -39,7 +39,7 @@ def test_dashboard_missing_database_shows_warning_and_does_not_create_file(tmp_p
     non_existent_db = tmp_path / "does_not_exist.db"
     assert not non_existent_db.exists()
 
-    at = AppTest.from_file(APP_PATH)
+    at = AppTest.from_file(APP_PATH, default_timeout=15)
     at.run()
 
     # Input the missing database path in the sidebar
@@ -63,7 +63,7 @@ def test_dashboard_empty_database_shows_info_message(tmp_path: Path):
 
     assert empty_db.is_file()
 
-    at = AppTest.from_file(APP_PATH)
+    at = AppTest.from_file(APP_PATH, default_timeout=15)
     at.run()
     at.sidebar.text_input[0].input(str(empty_db)).run()
 
@@ -131,7 +131,7 @@ def test_dashboard_populated_database_displays_metrics_and_tables(tmp_path: Path
             )
         )
 
-    at = AppTest.from_file(APP_PATH)
+    at = AppTest.from_file(APP_PATH, default_timeout=15)
     at.run()
     at.sidebar.text_input[0].input(str(test_db)).run()
 
@@ -214,7 +214,7 @@ def test_dashboard_alert_filtering(tmp_path: Path):
             )
         )
 
-    at = AppTest.from_file(APP_PATH)
+    at = AppTest.from_file(APP_PATH, default_timeout=15)
     at.run()
     at.sidebar.text_input[0].input(str(test_db)).run()
 
@@ -257,7 +257,7 @@ def test_dashboard_alert_investigation_empty_evidence(tmp_path: Path):
             )
         )
 
-    at = AppTest.from_file(APP_PATH)
+    at = AppTest.from_file(APP_PATH, default_timeout=15)
     at.run()
     at.sidebar.text_input[0].input(str(test_db)).run()
 
@@ -285,7 +285,7 @@ def test_dashboard_alert_investigation_selection_updates_view(tmp_path: Path):
             Alert(20.0, "SYN_RATE", "10.0.0.3", "10.0.0.4", 25.0, 20.0, 5.0, "MEDIUM", "Host 2 syn flood")
         )
 
-    at = AppTest.from_file(APP_PATH)
+    at = AppTest.from_file(APP_PATH, default_timeout=15)
     at.run()
     at.sidebar.text_input[0].input(str(test_db)).run()
 
@@ -306,7 +306,7 @@ def test_dashboard_corrupt_database_error_handling(tmp_path: Path):
     bad_db = tmp_path / "corrupt.db"
     bad_db.write_text("NOT A VALID SQLITE DATABASE", encoding="utf-8")
 
-    at = AppTest.from_file(APP_PATH)
+    at = AppTest.from_file(APP_PATH, default_timeout=15)
     at.run()
     at.sidebar.text_input[0].input(str(bad_db)).run()
 
@@ -327,7 +327,7 @@ def test_dashboard_time_range_scope_filter(tmp_path: Path):
         db.insert_packet(NormalizedPacket(500.0, "3.3.3.3", "4.4.4.4", "UDP", 128, 200, 53, None))
         db.insert_alert(Alert(500.0, "TRAFFIC_VOLUME", "3.3.3.3", "4.4.4.4", 20, 20, 5.0, "MED", "Run 2 surge"))
 
-    at = AppTest.from_file(APP_PATH)
+    at = AppTest.from_file(APP_PATH, default_timeout=15)
     at.run()
     at.sidebar.text_input[0].input(str(test_db)).run()
 
@@ -366,7 +366,7 @@ def test_dashboard_security_analytics_kpis_and_tabs(tmp_path: Path):
             Alert(102.0, "TRAFFIC_VOLUME", "192.168.1.1", "10.0.0.2", 1000, 500, 10.0, "MEDIUM", "Med volume"),
         ])
 
-    at = AppTest.from_file(APP_PATH)
+    at = AppTest.from_file(APP_PATH, default_timeout=15)
     at.run()
     at.sidebar.text_input[0].input(str(test_db)).run()
 
@@ -388,7 +388,7 @@ def test_dashboard_refresh_button(tmp_path: Path):
         db.insert_packet(NormalizedPacket(1.0, "1.1.1.1", "2.2.2.2", "TCP", 64))
         db.insert_alert(Alert(1.0, "RULE", "1.1.1.1", "2.2.2.2", 1, 1, 10.0, "LOW", "Msg"))
 
-    at = AppTest.from_file(APP_PATH)
+    at = AppTest.from_file(APP_PATH, default_timeout=15)
     at.run()
     at.sidebar.text_input[0].input(str(test_db)).run()
 

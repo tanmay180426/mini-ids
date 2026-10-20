@@ -28,12 +28,7 @@ logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 from scapy.all import AsyncSniffer, conf
 
 from capture.packet_capture import NormalizedPacket, normalize_packet
-from detection import (
-    Alert,
-    PortScanDetector,
-    SynRateDetector,
-    TrafficAnomalyDetector,
-)
+from detection import Alert
 # Default location for persistent project storage
 DEFAULT_DB_PATH = Path("data") / "mini_ids.db"
 
@@ -330,6 +325,9 @@ class LiveCaptureWorker:
             if self.custom_detectors is not None:
                 active_detectors = self.custom_detectors
             else:
+                from detection.port_scan import PortScanDetector
+                from detection.syn_rate import SynRateDetector
+                from detection.traffic_anomaly import TrafficAnomalyDetector
                 active_detectors = [
                     PortScanDetector(),
                     SynRateDetector(),

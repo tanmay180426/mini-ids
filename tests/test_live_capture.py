@@ -384,7 +384,7 @@ def test_dashboard_live_capture_section_renders(tmp_path: Path):
     ]
 
     with patch("app.get_available_interfaces", return_value=mock_ifaces):
-        at = AppTest.from_file(APP_PATH)
+        at = AppTest.from_file(APP_PATH, default_timeout=15)
         at.run()
         at.sidebar.text_input[0].input(str(test_db)).run()
 

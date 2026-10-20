@@ -1,177 +1,141 @@
-# Mini-IDS Architecture & Design Specification
+# Mini-IDS: Hybrid Security Analytics & Machine Learning Architecture
 
-## 1. System Overview
+## 1. Executive Summary
 
-**Mini-IDS** is a lightweight, educational Network Intrusion Detection System (NIDS) designed for Windows environments. It analyzes network traffic—either ingested from pre-recorded PCAP files or captured live from a local network interface—to detect suspicious activity and generate actionable security alerts.
+**Mini-IDS** is an intelligent, hybrid Network Intrusion Detection and Security Analytics Platform designed for Windows environments. It bridges traditional cybersecurity detection heuristics with supervised machine learning and unsupervised anomaly detection, underpinned by an interactive exploratory data science workspace.
 
-> [!IMPORTANT]
-> **Passive Detection (NIDS vs. NIPS):**
-> Mini-IDS is strictly a *detection* system (NIDS). It passively observes, parses, and evaluates network traffic to record security alerts. It **does not** act as an inline Intrusion Prevention System (NIPS): it does not drop packets, reset TCP sessions, or alter firewall rules.
+Mini-IDS operates under a strict **passive detection** paradigm: it observes, reconstructs, extracts tabular flow features, and evaluates traffic against heuristic rules and machine learning models to generate actionable security intelligence without inline disruption (e.g. packet dropping or session RST injection).
 
 ---
 
-## 2. End-to-End Pipeline & Data Flow
+## 2. End-to-End System Architecture
 
-Regardless of whether the input originates from an offline PCAP file or a live network adapter, all packets pass through the exact same processing pipeline:
-
-```
-+---------------------------+     +-------------------------------+
-|  Offline PCAP File        |     |  Live Network Interface       |
-|  (e.g., sample.pcap)      |     |  (via Scapy + Npcap)          |
-+-------------+-------------+     +---------------+---------------+
-              |                                   |
-              +-----------------+-----------------+
-                                |
-                                v
-               +---------------------------------+
-               |  Packet Ingestion & Reading     |
-               |  (capture/packet_capture.py)    |
-               +----------------+----------------+
-                                |
-                                v
-               +---------------------------------+
-               |  Normalization & Metadata       |
-               |  Extraction                     |
-               |  (Timestamp, IP, Port, Flags)   |
-               +----------------+----------------+
-                                |
-                                v
-               +---------------------------------+
-               |  Detection Engine Coordinator   |
-               |  (detection/...)                |
-               +----------------+----------------+
-                                |
-              +-----------------+-----------------+
-              |                 |                 |
-              v                 v                 v
-     +-----------------+ +-------------+ +------------------+
-     | TCP Port Scan   | | TCP SYN     | | Traffic Rate     |
-     | Rule            | | Rate Rule   | | Anomaly Rule     |
-     +--------+--------+ +------+------+ +--------+---------+
-              |                 |                 |
-              +-----------------+-----------------+
-                                | (Alert Events)
-                                v
-               +---------------------------------+
-               |  Alert Manager & Persistence    |
-               |  (storage/database.py)          |
-               +----------------+----------------+
-                                |
-                                v
-               +---------------------------------+
-               |  SQLite Database                |
-               |  (alerts.db)                    |
-               +----------------+----------------+
-                                |
-                                v
-               +---------------------------------+
-               |  Streamlit Security Dashboard   |
-               |  (app.py)                       |
-               +---------------------------------+
-```
-
----
-
-## 3. Module Responsibilities
-
-### 3.1 Packet Capture & Normalization (`capture/`)
-- **Offline PCAP Reader (`capture/packet_capture.py`):** Uses Scapy's `PcapReader` to stream packets iteratively from `.pcap` / `.pcapng` files without loading entire captures into memory.
-- **Live Interface Capture (`capture/live_capture.py`):**
-  - Interfaces with Windows packet drivers (Npcap) using Scapy's `AsyncSniffer`.
-  - Safe enumeration of adapters via `get_available_interfaces()`.
-  - Uses an internal bounded `queue.Queue` to decouple raw packet capture from detector execution and SQLite disk I/O, preventing packet drops.
-  - Manages background thread execution via `LiveCaptureWorker` with atomic status telemetry and stop triggers (duration timeout, packet count limit, manual stop).
-- **Packet Normalizer:** Decouples downstream detection from raw Scapy packet structures by extracting a normalized dataclass (`NormalizedPacket`):
-  - `timestamp`: Float (epoch seconds)
-  - `src_ip`: String
-  - `dst_ip`: String
-  - `protocol`: String (TCP, UDP, ICMP, OTHER)
-  - `src_port`: Integer (optional)
-  - `dst_port`: Integer (optional)
-  - `tcp_flags`: String (e.g., 'S', 'SA', 'FA', 'R')
-  - `length`: Integer (bytes)
-
-By normalizing traffic at ingestion, **offline replay and live capture share identical detection logic**.
-
-### 3.2 Detection Engine (`detection/`)
-The detection engine comprises three specialized detection modules operating over sliding time windows:
-
-1. **Potential TCP Port Scan (`detection/port_scan.py`):**
-   - *Threat Model:* An adversary probing a host to identify open listening ports and attack surface.
-   - *Logic:* Tracks unique destination ports contacted by a given `src_ip` within a rolling time window $\Delta t$. If the count of distinct `dst_port` values exceeds a threshold $N_{ports}$, an alert is raised.
-
-2. **Unusually High TCP SYN Rate (`detection/syn_rate.py`):**
-   - *Threat Model:* SYN flood denial-of-service (DoS) attempts or fast network scanners.
-   - *Logic:* Counts TCP packets where only the SYN flag is set (`flags == 'S'`) originating from a source IP or targeted at a destination IP within time window $\Delta t$. An alert is raised when the rate exceeds $N_{syn}$ packets/sec.
-
-3. **Traffic-Rate Volume Anomaly (`detection/traffic_anomaly.py`):**
-   - *Threat Model:* Network floods, data exfiltration, or sudden infrastructure anomalies.
-   - *Logic:* Aggregates aggregate packet counts and byte volumes across uniform rolling intervals. If the packet rate or byte throughput surges beyond a configured multiple of the rolling baseline or fixed safety threshold, an anomaly alert is triggered.
-
-### 3.3 Storage Layer (`storage/`)
-- **Database Engine:** Lightweight, embedded SQLite (`sqlite3`) with WAL (Write-Ahead Logging) journal mode for concurrent read/write access.
-- **Schema Design:**
-  - `packets` table: `id`, `timestamp` (epoch float), `src_ip`, `dst_ip`, `protocol`, `length`, `src_port`, `dst_port`, `tcp_flags`.
-  - `alerts` table: `id`, `timestamp` (epoch float), `rule_name`, `src_ip`, `dst_ip`, `observed_value`, `threshold`, `window_seconds`, `severity`, `message`.
-  - Indexes: B-tree indexes on `timestamp`, `src_ip`, `dst_ip`, and `rule_name` for sub-second analytical querying.
-- **Analysis Run Scoping:** The schema preserves raw cumulative records across offline PCAP and live sessions. Analysis isolation is performed via parameterized timestamp interval queries (`[start_time, end_time]`).
-
-### 3.4 User Interface & Dashboard (`app.py`)
-- **Dashboard Framework:** Streamlit + Altair for declarative interactive visualizations.
-- **Features:**
-  - **Live Packet Capture Controls:** Interface selection, stop condition controls (duration/count/manual), real-time status banners, and refreshable telemetry.
-  - **Executive summary KPIs:** Cumulative stored packets, total alerts, high-severity events, distinct alert sources.
-  - **Security analytics:** Alert severity distribution, detection rule breakdown, discrete column bar alert timeline, top offending sources, and top targeted destination hosts.
-  - **Traffic analytics:** Protocol distribution, top destination ports, network volume timeline, and top traffic destinations.
-  - **Alert investigation workflow:** Drill-down by alert ID with correlated packet evidence within sliding evaluation windows.
-  - **Scoped time-range filtering** and protocol/rule filters.
-
-### 3.5 Core Coordinator (`main.py`)
-- CLI entrypoint supporting both offline PCAP ingestion (`--pcap`) and live capture (`--interface`, `--count`, `--timeout`, `--list-interfaces`).
-
----
-
-## 4. Live Capture Concurrency & Safety Model
+The following diagram illustrates the complete data flow from network packets and PCAP traces to the Streamlit analytics interface:
 
 ```
-+---------------------------------------------------------------------------------+
-|                                Streamlit Main Thread                            |
-|  - Renders UI controls (Start / Stop / Refresh)                                 |
-|  - Queries worker snapshot via worker.get_status()                              |
-|  - Reads database records via read-only DatabaseManager                         |
-+----------------------------------------+----------------------------------------+
-                                         | (Configures & Starts Worker)
-                                         v
-+---------------------------------------------------------------------------------+
-|                       LiveCaptureWorker Thread (Daemon)                         |
-|  - Opens dedicated, thread-confined DatabaseManager instance                    |
-|  - Spawns Scapy AsyncSniffer on specified adapter                               |
-|  - Pulls normalized packets from thread-safe queue.Queue                        |
-|  - Evaluates PortScanDetector, SynRateDetector, TrafficAnomalyDetector          |
-|  - Batches packet and alert writes to SQLite (WAL mode)                         |
-|  - Monitors duration timeouts, packet limits, and manual stop events            |
-|  - Closes database connection cleanly upon completion                           |
-+----------------------------------------+----------------------------------------+
-                                         |
-                       +-----------------+-----------------+
-                       |                                   |
-                       v                                   v
-             [AsyncSniffer Sniff Thread]         [SQLite Database (WAL)]
-             - Captures raw L2/L3 frames         - Independent connections
-             - Normalizes packet metadata        - Atomic batch transactions
-             - Pushes to queue (non-blocking)    - Preserves historical records
++---------------------------------------------------------------------------------------+
+|                                    TRAFFIC INGESTION                                  |
+|                                                                                       |
+|  +---------------------------+                     +-------------------------------+  |
+|  |  Offline PCAP/PCAPNG File |                     |  Live Network Interface       |  |
+|  |  (capture/packet_capture) |                     |  (capture/live_capture.py)    |  |
+|  +-------------+-------------+                     +---------------+---------------+  |
++----------------|---------------------------------------------------|------------------+
+                 |                                                   |
+                 +-------------------------+-------------------------+
+                                           |
+                                           v
++---------------------------------------------------------------------------------------+
+|                             PACKET NORMALIZATION LAYER                                |
+|                                                                                       |
+|   NormalizedPacket: timestamp, src_ip, dst_ip, src_port, dst_port, protocol,          |
+|                     tcp_flags, length                                                 |
++------------------------------------------+--------------------------------------------+
+                                           |
+                    +----------------------+----------------------+
+                    |                                             |
+                    v                                             v
++--------------------------------------+      +-----------------------------------------+
+|     STREAMING HEURISTIC ENGINE       |      |     BIDIRECTIONAL FLOW AGGREGATOR       |
+|                                      |      |     (ml/feature_extraction.py)          |
+|  +--------------------------------+  |      |                                         |
+|  | PortScanDetector (Windowed)    |  |      |  - Canonical 5-Tuple Key Tracking       |
+|  +--------------------------------+  |      |  - Forward & Backward Packet Tracking   |
+|  | SynRateDetector (Windowed)     |  |      |  - Timeout & FIN/RST Flow Eviction      |
+|  +--------------------------------+  |      |  - 28 Tabular Statistical Features      |
+|  | TrafficAnomalyDetector (Vol.)  |  |      +--------------------+--------------------+
+|  +--------------------------------+  |                           |
++-------------------+------------------+                           | Completed Flows
+                    |                                              v
+                    | Heuristic Alerts        +-----------------------------------------+
+                    |                         |        MACHINE LEARNING PIPELINE        |
+                    |                         |                                         |
+                    |                         |  +-----------------------------------+  |
+                    |                         |  | Scaler & Imputer Transformers     |  |
+                    |                         |  +-----------------------------------+  |
+                    |                         |  | Supervised Classifier             |  |
+                    |                         |  | (Random Forest / Logistic Reg.)   |  |
+                    |                         |  +-----------------------------------+  |
+                    |                         |  | Unsupervised Anomaly Detector     |  |
+                    |                         |  | (Isolation Forest Baseline)       |  |
+                    |                         |  +-----------------------------------+  |
+                    |                         +--------------------+--------------------+
+                    |                                              |
+                    +----------------------+-----------------------+
+                                           | Correlated Alerts & Flows
+                                           v
++---------------------------------------------------------------------------------------+
+|                             PERSISTENT SQLITE STORAGE                                 |
+|                                                                                       |
+|   Tables: packets | alerts | flows | models                                           |
+|   WAL Journaling Mode | B-Tree Indexes on timestamp, IPs, rule_name                   |
++------------------------------------------+--------------------------------------------+
+                                           |
+                                           v
++---------------------------------------------------------------------------------------+
+|                       STREAMLIT 9-PAGE SECURITY DASHBOARD                             |
+|                                                                                       |
+|  [1] Overview            [4] Traffic Intelligence     [7] Data Explorer               |
+|  [2] Live Monitoring     [5] AI/ML Detection          [8] Detection Rules             |
+|  [3] Alert Investigation [6] Model Laboratory         [9] System & Settings           |
++---------------------------------------------------------------------------------------+
 ```
 
 ---
 
-## 5. Current Status vs. Milestone Plan
+## 3. Subsystem Breakdown
 
-| Component | Status | Target Milestone |
-|---|---|---|
-| Project Structure & Environment | **Completed** | Milestone 0 |
-| PCAP Reader & Normalizer | **Completed** | Milestone 1 |
-| Detection Rules (Port scan, SYN, Volume) | **Completed** | Milestone 2 |
-| SQLite Alert & Packet Storage | **Completed** | Milestone 3 |
-| Streamlit Dashboard & CLI Runner | **Completed** | Milestone 4 |
-| Live Packet Capture & Npcap Sniffing | **Completed** | Live Capture Milestone |
+### 3.1 Ingestion & Normalization (`capture/`)
+- **Offline PCAP Reader (`capture/packet_capture.py`):** Iteratively yields packets using Scapy's `PcapReader` without memory bloat.
+- **Live Windows Sniffer (`capture/live_capture.py`):** Interacts with Npcap via Scapy's `AsyncSniffer`. Implements a decoupled multi-threaded worker using a thread-safe `queue.Queue` to separate raw packet capture from disk I/O and detection logic.
+- **Packet Normalizer:** Standardizes disparate protocol structures into a uniform `NormalizedPacket` dataclass, ensuring that offline replays and live network streams execute identical downstream logic.
 
+### 3.2 Bidirectional Flow Aggregation (`ml/feature_extraction.py`)
+- Maintains active in-flight network flows using a canonical, direction-agnostic 5-tuple:
+  `canonical_key = (min(ip1, ip2), max(ip1, ip2), min(port1, port2), max(port1, port2), protocol)`
+- Tracks directional forward (`fwd_stats`) and backward (`bwd_stats`) counters, packet length distributions, and inter-arrival times (IAT).
+- Evicts completed flows either upon observation of TCP `FIN`/`RST` termination flags or when the idle timeout (default: 15.0 seconds) expires.
+- Computes 28 statistical features matching the standard **CICIDS2017** feature conventions.
+
+### 3.3 Hybrid Detection Engine (`detection/hybrid_detection.py`)
+The `HybridDetectionEngine` coordinates multiple detection methodologies:
+1. **Rule-Based Heuristic Detectors:**
+   - `PortScanDetector`: Tracks unique destination ports contacted per source IP over sliding time windows.
+   - `SynRateDetector`: Evaluates TCP SYN flag arrival rates to identify volumetric SYN flood attempts.
+   - `TrafficAnomalyDetector`: Flags byte or packet rate surges exceeding rolling baseline thresholds.
+2. **Supervised ML Classification:**
+   - Transforms extracted flow features using a serialized preprocessing pipeline.
+   - Evaluates Random Forest, Logistic Regression, or Gradient Boosted trees.
+   - Generates alerts tagged with `detection_method='ML_SUPERVISED'` along with model version and confidence probability.
+3. **Unsupervised Anomaly Detection:**
+   - Applies an Isolation Forest model trained exclusively on benign baseline flow distributions.
+   - Evaluates decision functions and generates normalized anomaly scores `[0.0, 1.0]`.
+   - Alerts on flows exceeding calibrated contamination thresholds with `detection_method='ML_ANOMALY'`.
+
+### 3.4 Model Registry & Artifact Management (`ml/model_registry.py`)
+- Versioned storage for trained models, preprocessors, and JSON metadata manifests in `data/models/<version>/`.
+- Atomic registration and activation management tracked within the SQLite `models` table.
+- Dry-run validation of model integrity and feature schema alignment prior to activation.
+
+### 3.5 Database & Storage Layer (`storage/database.py`)
+Persistent storage is implemented in SQLite with additive, backward-compatible migrations:
+- **`packets` table:** Normalized packet logs indexed by timestamp, source IP, destination IP, and protocol.
+- **`alerts` table:** Security alert events with `detection_method`, `model_version`, `confidence`, and `anomaly_score`.
+- **`flows` table:** Completed network flow records with extracted statistical features serialized as JSON.
+- **`models` table:** Registered machine learning model metadata, performance metrics, and activation flags.
+
+---
+
+## 4. UI/UX Design System
+
+The platform user interface is built in **Streamlit** following a professional, restrained aesthetic:
+- **Palette:**
+  - Background: `#F6F5F0` (Warm Canvas)
+  - Sidebar: `#202C3B` (Dark Navy Slate)
+  - Cards: `#FFFFFF` (Crisp White with `#E2E3DE` borders)
+  - Primary Accent: `#C76D45` (Terracotta)
+  - Secondary Accent: `#52877F` (Sage Teal)
+  - Critical Alerts: `#C65353` (Crimson)
+  - Warnings: `#D5A13B` (Amber)
+  - Text: `#252A31` (Deep Charcoal)
+- **Visualizations:** High-density, accessible Altair charts utilizing discrete interval binning to eliminate misleading interpolation across observation gaps.

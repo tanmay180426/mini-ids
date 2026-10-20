@@ -62,7 +62,25 @@ class DatabaseManager:
             except sqlite3.Error as err:
                 logger.error("Failed to enable WAL journal mode: %s", err)
                 raise
+            self._run_migrations(self._connection)
         return self._connection
+
+    def _run_migrations(self, conn: sqlite3.Connection) -> None:
+        """Run idempotent additive migrations for existing tables."""
+        try:
+            c = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='alerts';")
+            if c.fetchone():
+                alert_cols = {row["name"] for row in conn.execute("PRAGMA table_info(alerts);").fetchall()}
+                if "detection_method" not in alert_cols:
+                    conn.execute("ALTER TABLE alerts ADD COLUMN detection_method TEXT DEFAULT 'HEURISTIC';")
+                if "model_version" not in alert_cols:
+                    conn.execute("ALTER TABLE alerts ADD COLUMN model_version TEXT;")
+                if "confidence" not in alert_cols:
+                    conn.execute("ALTER TABLE alerts ADD COLUMN confidence REAL;")
+                if "anomaly_score" not in alert_cols:
+                    conn.execute("ALTER TABLE alerts ADD COLUMN anomaly_score REAL;")
+        except Exception as e:
+            logger.debug("Migration check skipped: %s", e)
 
     def init_db(self) -> None:
         """Create the database tables and indexes if they do not already exist.
@@ -145,6 +163,88 @@ class DatabaseManager:
                 """
                 CREATE INDEX IF NOT EXISTS idx_alerts_severity
                 ON alerts(severity);
+                """
+            )
+
+            # 3. Additive Column Migrations for Existing Databases
+            alert_cols = {row["name"] for row in conn.execute("PRAGMA table_info(alerts);").fetchall()}
+            if "detection_method" not in alert_cols:
+                conn.execute("ALTER TABLE alerts ADD COLUMN detection_method TEXT DEFAULT 'HEURISTIC';")
+            if "model_version" not in alert_cols:
+                conn.execute("ALTER TABLE alerts ADD COLUMN model_version TEXT;")
+            if "confidence" not in alert_cols:
+                conn.execute("ALTER TABLE alerts ADD COLUMN confidence REAL;")
+            if "anomaly_score" not in alert_cols:
+                conn.execute("ALTER TABLE alerts ADD COLUMN anomaly_score REAL;")
+
+            # 4. Models Table (Trained ML Artifact Registry)
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS models (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    version TEXT NOT NULL UNIQUE,
+                    model_type TEXT NOT NULL,
+                    algorithm TEXT NOT NULL,
+                    dataset_name TEXT,
+                    task_type TEXT,
+                    metrics_json TEXT,
+                    feature_schema_json TEXT,
+                    artifact_path TEXT,
+                    created_at REAL NOT NULL,
+                    is_active INTEGER DEFAULT 0
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_models_version
+                ON models(version);
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_models_active
+                ON models(is_active);
+                """
+            )
+
+            # 5. Flows Table (Network Flow Summaries)
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS flows (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    flow_id TEXT NOT NULL,
+                    start_time REAL NOT NULL,
+                    end_time REAL NOT NULL,
+                    duration REAL NOT NULL,
+                    src_ip TEXT NOT NULL,
+                    dst_ip TEXT NOT NULL,
+                    src_port INTEGER,
+                    dst_port INTEGER,
+                    protocol TEXT NOT NULL,
+                    packet_count INTEGER NOT NULL,
+                    byte_count INTEGER NOT NULL,
+                    fwd_packets INTEGER NOT NULL,
+                    bwd_packets INTEGER NOT NULL,
+                    fwd_bytes INTEGER NOT NULL,
+                    bwd_bytes INTEGER NOT NULL,
+                    flow_pkts_s REAL NOT NULL,
+                    flow_bytes_s REAL NOT NULL,
+                    features_json TEXT
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_flows_time
+                ON flows(start_time, end_time);
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_flows_src_dst
+                ON flows(src_ip, dst_ip);
                 """
             )
 
@@ -240,8 +340,9 @@ class DatabaseManager:
             INSERT INTO alerts (
                 timestamp, rule_name, src_ip, dst_ip,
                 observed_value, threshold, window_seconds,
-                severity, message
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                severity, message, detection_method,
+                model_version, confidence, anomaly_score
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
         params = (
             float(alert.timestamp),
@@ -253,6 +354,10 @@ class DatabaseManager:
             float(alert.window_seconds),
             str(alert.severity),
             str(alert.message),
+            getattr(alert, "detection_method", "HEURISTIC") or "HEURISTIC",
+            getattr(alert, "model_version", None),
+            getattr(alert, "confidence", None),
+            getattr(alert, "anomaly_score", None),
         )
         with conn:
             cursor = conn.execute(query, params)
@@ -272,8 +377,9 @@ class DatabaseManager:
             INSERT INTO alerts (
                 timestamp, rule_name, src_ip, dst_ip,
                 observed_value, threshold, window_seconds,
-                severity, message
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                severity, message, detection_method,
+                model_version, confidence, anomaly_score
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
         param_list = [
             (
@@ -286,6 +392,10 @@ class DatabaseManager:
                 float(a.window_seconds),
                 str(a.severity),
                 str(a.message),
+                getattr(a, "detection_method", "HEURISTIC") or "HEURISTIC",
+                getattr(a, "model_version", None),
+                getattr(a, "confidence", None),
+                getattr(a, "anomaly_score", None),
             )
             for a in alerts
         ]
@@ -358,7 +468,8 @@ class DatabaseManager:
             query = f"""
                 SELECT id, timestamp, rule_name, src_ip, dst_ip,
                        observed_value, threshold, window_seconds,
-                       severity, message
+                       severity, message, detection_method,
+                       model_version, confidence, anomaly_score
                 FROM alerts
                 ORDER BY timestamp {clean_order}, id {clean_order}
                 LIMIT ? OFFSET ?;
@@ -368,7 +479,8 @@ class DatabaseManager:
             query = f"""
                 SELECT id, timestamp, rule_name, src_ip, dst_ip,
                        observed_value, threshold, window_seconds,
-                       severity, message
+                       severity, message, detection_method,
+                       model_version, confidence, anomaly_score
                 FROM alerts
                 ORDER BY timestamp {clean_order}, id {clean_order};
             """
@@ -389,7 +501,8 @@ class DatabaseManager:
         query = """
             SELECT id, timestamp, rule_name, src_ip, dst_ip,
                    observed_value, threshold, window_seconds,
-                   severity, message
+                   severity, message, detection_method,
+                   model_version, confidence, anomaly_score
             FROM alerts
             WHERE id = ?;
         """
@@ -1045,6 +1158,217 @@ class DatabaseManager:
         conn = self.get_connection()
         cursor = conn.execute(query, tuple(params))
         return [dict(row) for row in cursor.fetchall()]
+
+    def get_detection_method_distribution(
+        self,
+        start_time: Optional[float] = None,
+        end_time: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        """Aggregate alert counts by detection method (HEURISTIC, ML_SUPERVISED, ML_ANOMALY, HYBRID)."""
+        conditions = []
+        params: List[Any] = []
+        if start_time is not None:
+            conditions.append("timestamp >= ?")
+            params.append(float(start_time))
+        if end_time is not None:
+            conditions.append("timestamp <= ?")
+            params.append(float(end_time))
+
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        query = f"""
+            SELECT COALESCE(detection_method, 'HEURISTIC') AS detection_method, COUNT(*) AS count
+            FROM alerts
+            {where_clause}
+            GROUP BY detection_method
+            ORDER BY count DESC;
+        """
+        conn = self.get_connection()
+        cursor = conn.execute(query, tuple(params))
+        return [dict(row) for row in cursor.fetchall()]
+
+    # --------------------------------------------------------------------------
+    # Model Registry Methods
+    # --------------------------------------------------------------------------
+
+    def insert_model(self, model_meta: Dict[str, Any]) -> int:
+        """Insert or replace a trained machine learning model record in the registry."""
+        import json
+        conn = self.get_connection()
+        query = """
+            INSERT OR REPLACE INTO models (
+                name, version, model_type, algorithm, dataset_name,
+                task_type, metrics_json, feature_schema_json,
+                artifact_path, created_at, is_active
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """
+        metrics_str = (
+            json.dumps(model_meta.get("metrics", {}))
+            if isinstance(model_meta.get("metrics"), dict)
+            else str(model_meta.get("metrics_json", "{}"))
+        )
+        schema_str = (
+            json.dumps(model_meta.get("feature_schema", []))
+            if isinstance(model_meta.get("feature_schema"), (list, dict))
+            else str(model_meta.get("feature_schema_json", "[]"))
+        )
+        params = (
+            str(model_meta["name"]),
+            str(model_meta["version"]),
+            str(model_meta.get("model_type", "supervised")),
+            str(model_meta.get("algorithm", "unknown")),
+            model_meta.get("dataset_name"),
+            model_meta.get("task_type", "binary"),
+            metrics_str,
+            schema_str,
+            str(model_meta.get("artifact_path", "")),
+            float(model_meta.get("created_at", 0.0)),
+            1 if model_meta.get("is_active") else 0,
+        )
+        with conn:
+            cursor = conn.execute(query, params)
+            return cursor.lastrowid
+
+    def get_models(self) -> List[Dict[str, Any]]:
+        """Retrieve all registered models ordered by creation time descending."""
+        import json
+        conn = self.get_connection()
+        query = "SELECT * FROM models ORDER BY created_at DESC;"
+        cursor = conn.execute(query)
+        rows = []
+        for r in cursor.fetchall():
+            d = dict(r)
+            try:
+                d["metrics"] = json.loads(d.get("metrics_json") or "{}")
+            except Exception:
+                d["metrics"] = {}
+            try:
+                d["feature_schema"] = json.loads(d.get("feature_schema_json") or "[]")
+            except Exception:
+                d["feature_schema"] = []
+            rows.append(d)
+        return rows
+
+    def get_active_model(self, model_type: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Retrieve the currently active model, optionally filtered by model_type."""
+        import json
+        conn = self.get_connection()
+        if model_type:
+            query = "SELECT * FROM models WHERE is_active = 1 AND model_type = ? ORDER BY created_at DESC LIMIT 1;"
+            cursor = conn.execute(query, (str(model_type),))
+        else:
+            query = "SELECT * FROM models WHERE is_active = 1 ORDER BY created_at DESC LIMIT 1;"
+            cursor = conn.execute(query)
+        row = cursor.fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        try:
+            d["metrics"] = json.loads(d.get("metrics_json") or "{}")
+        except Exception:
+            d["metrics"] = {}
+        try:
+            d["feature_schema"] = json.loads(d.get("feature_schema_json") or "[]")
+        except Exception:
+            d["feature_schema"] = []
+        return d
+
+    def set_active_model(self, version: str, is_active: bool = True) -> bool:
+        """Set a model version as active (deactivating others of the same model_type)."""
+        conn = self.get_connection()
+        with conn:
+            c = conn.execute("SELECT model_type FROM models WHERE version = ?;", (version,))
+            row = c.fetchone()
+            if not row:
+                return False
+            mtype = row[0]
+            if is_active:
+                conn.execute("UPDATE models SET is_active = 0 WHERE model_type = ?;", (mtype,))
+                conn.execute("UPDATE models SET is_active = 1 WHERE version = ?;", (version,))
+            else:
+                conn.execute("UPDATE models SET is_active = 0 WHERE version = ?;", (version,))
+        return True
+
+    def get_model_by_version(self, version: str) -> Optional[Dict[str, Any]]:
+        """Retrieve a registered model record by version string."""
+        import json
+        conn = self.get_connection()
+        query = "SELECT * FROM models WHERE version = ?;"
+        cursor = conn.execute(query, (str(version),))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        try:
+            d["metrics"] = json.loads(d.get("metrics_json") or "{}")
+        except Exception:
+            d["metrics"] = {}
+        try:
+            d["feature_schema"] = json.loads(d.get("feature_schema_json") or "[]")
+        except Exception:
+            d["feature_schema"] = []
+        return d
+
+    # --------------------------------------------------------------------------
+    # Flow Persistence Methods
+    # --------------------------------------------------------------------------
+
+    def insert_flows(self, flows: Iterable[Any]) -> int:
+        """Insert multiple flow records in a single transaction."""
+        import json
+        conn = self.get_connection()
+        query = """
+            INSERT INTO flows (
+                flow_id, start_time, end_time, duration,
+                src_ip, dst_ip, src_port, dst_port, protocol,
+                packet_count, byte_count, fwd_packets, bwd_packets,
+                fwd_bytes, bwd_bytes, flow_pkts_s, flow_bytes_s, features_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """
+        param_list = []
+        for f in flows:
+            feat_dict = getattr(f, "features", {}) if hasattr(f, "features") else (f.get("features", {}) if isinstance(f, dict) else {})
+            param_list.append((
+                str(getattr(f, "flow_id", f.get("flow_id") if isinstance(f, dict) else "")),
+                float(getattr(f, "start_time", f.get("start_time", 0.0) if isinstance(f, dict) else 0.0)),
+                float(getattr(f, "end_time", f.get("end_time", 0.0) if isinstance(f, dict) else 0.0)),
+                float(getattr(f, "duration", f.get("duration", 0.0) if isinstance(f, dict) else 0.0)),
+                str(getattr(f, "src_ip", f.get("src_ip", "") if isinstance(f, dict) else "")),
+                str(getattr(f, "dst_ip", f.get("dst_ip", "") if isinstance(f, dict) else "")),
+                getattr(f, "src_port", f.get("src_port") if isinstance(f, dict) else None),
+                getattr(f, "dst_port", f.get("dst_port") if isinstance(f, dict) else None),
+                str(getattr(f, "protocol", f.get("protocol", "TCP") if isinstance(f, dict) else "TCP")),
+                int(getattr(f, "packet_count", f.get("packet_count", 0) if isinstance(f, dict) else 0)),
+                int(getattr(f, "byte_count", f.get("byte_count", 0) if isinstance(f, dict) else 0)),
+                int(getattr(f, "fwd_packets", f.get("fwd_packets", 0) if isinstance(f, dict) else 0)),
+                int(getattr(f, "bwd_packets", f.get("bwd_packets", 0) if isinstance(f, dict) else 0)),
+                int(getattr(f, "fwd_bytes", f.get("fwd_bytes", 0) if isinstance(f, dict) else 0)),
+                int(getattr(f, "bwd_bytes", f.get("bwd_bytes", 0) if isinstance(f, dict) else 0)),
+                float(getattr(f, "flow_pkts_s", f.get("flow_pkts_s", 0.0) if isinstance(f, dict) else 0.0)),
+                float(getattr(f, "flow_bytes_s", f.get("flow_bytes_s", 0.0) if isinstance(f, dict) else 0.0)),
+                json.dumps(feat_dict) if isinstance(feat_dict, dict) else "{}",
+            ))
+        if not param_list:
+            return 0
+        with conn:
+            conn.executemany(query, param_list)
+        return len(param_list)
+
+    def get_flows(self, limit: Optional[int] = 100, offset: int = 0) -> List[Dict[str, Any]]:
+        """Retrieve stored flow records."""
+        conn = self.get_connection()
+        if limit is not None:
+            query = "SELECT * FROM flows ORDER BY start_time DESC LIMIT ? OFFSET ?;"
+            cursor = conn.execute(query, (int(limit), int(offset)))
+        else:
+            query = "SELECT * FROM flows ORDER BY start_time DESC;"
+            cursor = conn.execute(query)
+        return [dict(r) for r in cursor.fetchall()]
+
+    def get_flow_count(self) -> int:
+        """Return total flow records count."""
+        conn = self.get_connection()
+        cursor = conn.execute("SELECT COUNT(*) FROM flows;")
+        return cursor.fetchone()[0]
 
     def close(self) -> None:
         """Safely close the SQLite database connection if open."""

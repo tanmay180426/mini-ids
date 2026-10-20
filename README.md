@@ -1,250 +1,248 @@
-# Mini-IDS: Network Intrusion Detection System
+# Mini-IDS: Intelligent Network Security Analytics Platform
 
-A lightweight, modular, educational Network Intrusion Detection System (NIDS) built with Python, Scapy, SQLite, and Streamlit on Windows.
+[![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue.svg)](https://www.python.org/)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20x64-lightgrey.svg)](https://www.microsoft.com/windows)
+[![Tests](https://img.shields.io/badge/Tests-125%20Passed-brightgreen.svg)](tests/)
+[![Security](https://img.shields.io/badge/NIDS-Passive%20Hybrid%20Detection-orange.svg)](docs/architecture.md)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-> [!NOTE]
-> **Project Status: Live Packet Capture, Demonstration Mode & Security Analytics Completed**
-> The project provides dual ingestion pipelines (offline PCAP analysis and Npcap live packet capture), persistent SQLite database storage, heuristic detection rules (Port Scan, SYN Rate, Traffic Anomaly), an automated test suite (103 passed), a deterministic synthetic demonstration mode for cloud hosting, and an interactive Streamlit Security Analytics Dashboard with alert investigation and live capture controls.
+An intelligent, hybrid Network Intrusion Detection System (NIDS) and Exploratory Security Analytics Platform built with Python, Scapy, scikit-learn, SQLite, and Streamlit.
 
----
-
-## 1. What is a Network IDS?
-
-A **Network Intrusion Detection System (NIDS)** is a security tool that monitors network traffic passing through a network segment or host interface. By inspecting packet headers and traffic statistics, a NIDS identifies patterns matching known malicious activities (signature-based) or abnormal deviations from normal behavior (anomaly-based).
-
-Mini-IDS operates as a **passive detection system**: it logs events and notifies analysts via a dashboard, but it does **not** block network traffic or alter packet routing. Detected anomalies indicate suspicious or elevated activity according to heuristic thresholds; they represent correlated network telemetry rather than definitive proof of malicious intent or host compromise.
-
----
-
-## 2. Implemented Features & Detection Capabilities
-
-- **Dual Ingestion Architecture:**
-  - **Offline PCAP/PCAPNG Ingestion (Primary):** Deterministic, repeatable ingestion of network trace files via Scapy.
-  - **Optional Live Capture:** Passive live sniffing on Windows interfaces (requires administrative privileges and Npcap).
-  - **Hosted Demonstration Mode:** Built-in deterministic synthetic telemetry for public cloud evaluation without exposing local data.
-- **Three Core Detection Modules:**
-  1. **TCP Port Scan Detection:** Identifies rapid probing across multiple unique destination ports on a target host within a configurable time window.
-  2. **TCP SYN Rate Anomaly:** Flags abnormally elevated rates of SYN packets without completed handshakes (e.g., SYN flood patterns or fast scans).
-  3. **Traffic Volume Anomaly:** Detects sudden volumetric surges in packet rate or byte throughput exceeding baseline thresholds.
-- **Persistent SQLite Storage:**
-  - Structured storage for normalized packets and security alerts.
-  - WAL journal mode enabled for high-concurrency read/write operations.
-  - Indexed queries for time-range filtering, alert-packet correlation, and analytics aggregations.
-- **Streamlit Security Analytics Dashboard:**
-  - **Security Overview KPIs:** Total packet counts, alert counts, and high-severity counters.
-  - **Scoped Filtering:** Independent alert filters (Rule, Severity, Time Range) and traffic filters (Protocol, Time Range) with explicit UI labels.
-  - **Discrete Timeline Visualizations:** High-fidelity vertical column bar charts for alert frequencies and traffic volume over time without misleading continuous interpolations across observation gaps.
-  - **Alert Investigation & Evidence Correlation:** Interactive alert selection that queries and displays correlated network packets within an adjustable +/- time buffer.
-  - **Traffic Analytics:** Protocol distribution donuts, top targeted destination ports, and most active destination hosts.
+Designed for Computer Science & Engineering final-year evaluations, technical reviews, and cybersecurity operations research, Mini-IDS integrates three interconnected disciplines:
+1. **Cybersecurity & Network Forensics:** Stateful heuristic rule detection, raw packet dissection, bidirectional flow reconstruction, and timeline evidence correlation.
+2. **Artificial Intelligence & Machine Learning:** Supervised classification (Random Forest, Logistic Regression, HistGradientBoosting) and unsupervised anomaly detection (Isolation Forest) with model explainability and defensive triage playbooks.
+3. **Data Science & Traffic Analytics:** Statistical dataset profiling, correlation analysis, discrete interval traffic binning, and interactive exploratory data analysis (EDA).
 
 ---
 
-## 3. Technology Stack
+## 1. System Architecture & Capabilities
 
-- **Language:** Python 3.10+ (Tested with Python 3.13)
-- **Packet Ingestion & Dissection:** [Scapy](https://scapy.net/)
-- **Data Manipulation & Analytics:** [Pandas](https://pandas.pydata.org/), [Altair](https://altair-viz.github.io/)
-- **Persistent Storage:** SQLite3 (Python standard library)
-- **Security Dashboard:** [Streamlit](https://streamlit.io/)
-- **Automated Testing:** [pytest](https://docs.pytest.org/)
-
----
-
-## 4. Project Directory Structure
-
-```text
-mini-ids/
-├── capture/                    # Packet ingestion and normalization
-│   ├── __init__.py
-│   ├── packet_capture.py       # Scapy PCAP reader and packet normalizer
-│   └── live_capture.py         # Npcap background sniffer worker and interface resolver
-├── detection/                  # Heuristic detection algorithms
-│   ├── __init__.py
-│   ├── port_scan.py            # TCP port scan detector
-│   ├── syn_rate.py             # TCP SYN rate anomaly detector
-│   └── traffic_anomaly.py      # Volumetric traffic anomaly detector
-├── storage/                    # Persistent alert & packet database
-│   ├── __init__.py
-│   ├── database.py             # SQLite schema, queries, and aggregations
-│   └── demo_data.py            # Deterministic synthetic dataset for hosted demonstration mode
-├── tests/                      # Comprehensive test suite (103 tests)
-│   ├── __init__.py
-│   ├── test_capture.py         # Capture and packet normalization tests
-│   ├── test_detection.py       # Core detector logic and alert tests
-│   ├── test_boundary_detection.py # Edge cases and boundary condition tests
-│   ├── test_storage.py         # SQLite CRUD, indexing, and aggregation tests
-│   ├── test_end_to_end.py      # Full pipeline CLI ingestion tests
-│   ├── test_dashboard.py       # Headless Streamlit integration and chart tests
-│   ├── test_live_capture.py    # Live capture worker, interface enumeration, and UI tests
-│   └── test_demo_mode.py       # Demonstration mode and synthetic dataset tests
-├── data/                       # Local data folder (.gitignore excludes *.db and *.pcap)
-│   └── .gitkeep
-├── docs/                       # Technical documentation
-│   └── architecture.md         # System architecture and data flow
-├── app.py                      # Interactive Streamlit security dashboard
-├── main.py                     # CLI pipeline entry point
-├── inspect_alerts.py           # Quick CLI diagnostic script for alerts
-├── inspect_db.py               # Quick CLI diagnostic script for database summary
-├── requirements.txt            # Project dependencies
-├── README.md                   # Project documentation and setup guide
-└── .gitignore                  # Git exclusions for databases, pcaps, caches, and venv
+```
++---------------------------------------------------------------------------------------+
+|                                    TRAFFIC INGESTION                                  |
+|                                                                                       |
+|  +---------------------------+                     +-------------------------------+  |
+|  |  Offline PCAP/PCAPNG File |                     |  Live Network Interface       |  |
+|  |  (capture/packet_capture) |                     |  (capture/live_capture.py)    |  |
+|  +-------------+-------------+                     +---------------+---------------+  |
++----------------|---------------------------------------------------|------------------+
+                 |                                                   |
+                 +-------------------------+-------------------------+
+                                           |
+                                           v
++---------------------------------------------------------------------------------------+
+|                             PACKET NORMALIZATION LAYER                                |
+|                                                                                       |
+|   NormalizedPacket: timestamp, src_ip, dst_ip, src_port, dst_port, protocol,          |
+|                     tcp_flags, length                                                 |
++------------------------------------------+--------------------------------------------+
+                                           |
+                    +----------------------+----------------------+
+                    |                                             |
+                    v                                             v
++--------------------------------------+      +-----------------------------------------+
+|     STREAMING HEURISTIC ENGINE       |      |     BIDIRECTIONAL FLOW AGGREGATOR       |
+|                                      |      |     (ml/feature_extraction.py)          |
+|  - PortScanDetector (Windowed)       |      |                                         |
+|  - SynRateDetector (Windowed)        |      |  - Canonical 5-Tuple Key Tracking       |
+|  - TrafficAnomalyDetector (Vol.)     |      |  - 28 Tabular Statistical Features      |
++-------------------+------------------+      +--------------------+--------------------+
+                    |                                              | Completed Flows
+                    | Heuristic Alerts                             v
+                    |                         +-----------------------------------------+
+                    |                         |        MACHINE LEARNING PIPELINE        |
+                    |                         |                                         |
+                    |                         |  - Supervised Random Forest Classifier  |
+                    |                         |  - Supervised Logistic Regression       |
+                    |                         |  - Unsupervised Isolation Forest        |
+                    |                         +--------------------+--------------------+
+                    |                                              |
+                    +----------------------+-----------------------+
+                                           | Correlated Alerts & Flows
+                                           v
++---------------------------------------------------------------------------------------+
+|                             PERSISTENT SQLITE STORAGE                                 |
+|                                                                                       |
+|   Tables: packets | alerts | flows | models (WAL journal mode)                        |
++------------------------------------------+--------------------------------------------+
+                                           |
+                                           v
++---------------------------------------------------------------------------------------+
+|                       STREAMLIT 9-PAGE SECURITY DASHBOARD                             |
+|                                                                                       |
+|  [1] Overview            [4] Traffic Intelligence     [7] Data Explorer               |
+|  [2] Live Monitoring     [5] AI/ML Detection          [8] Detection Rules             |
+|  [3] Alert Investigation [6] Model Laboratory         [9] System & Settings           |
++---------------------------------------------------------------------------------------+
 ```
 
 ---
 
-## 5. Prerequisites & System Requirements
+## 2. Key Features
 
-1. **Python 3.10 or higher:** Verify with `python --version` in PowerShell or terminal.
-2. **PowerShell Script Execution (Windows):** To enable virtual environment activation:
-   ```powershell
-   Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
-   ```
-3. **Npcap (Only for Live Capture):** If running live network capture on Windows, install [Npcap](https://npcap.com/) with "WinPcap API-compatible Mode" enabled. **Offline PCAP ingestion does not require Npcap.**
-4. **Data Privacy Notice:** Local SQLite databases (`*.db`) and raw capture files (`*.pcap`, `*.pcapng`) are intentionally excluded from Git tracking via `.gitignore` to protect privacy and keep the repository clean.
+- **Hybrid Detection Engine (`detection/hybrid_detection.py`):** Correlates real-time packet heuristics with flow-level supervised predictions and unsupervised Isolation Forest outlier scores.
+- **Leakage-Free ML Pipeline (`ml/`):** Full end-to-end scikit-learn pipeline featuring imputer and scaler transformers fitted strictly on training partitions, stratified and temporal splitting, and verifiable metadata manifests.
+- **Model Registry & Validation (`ml/model_registry.py`):** Versioned model artifact bundles with dry-run schema validation and hot-swappable active model activation.
+- **Model Explainability & Defensive Triage (`ml/explainability.py`):** Global feature importances, local flow threat attributions, and actionable incident response recommendations.
+- **Restrained Professional UI (`analytics/theme.py`):** Custom warm-neutral aesthetic (`#F6F5F0` background, `#202C3B` slate sidebar, `#C76D45` terracotta accent) eliminating generic neon AI templates.
+- **Offline & Live Capture:** Stream PCAP files or sniff live Windows interfaces via Npcap without dropping packets (buffered asynchronous background worker).
+- **Sanitized Demonstration Mode (`storage/demo_data.py`):** Built-in deterministic synthetic telemetry utilizing RFC 5737 documentation IP prefixes (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`) for cloud deployments and demonstrations without accessing live network adapters.
 
 ---
 
-## 6. Installation & Environment Setup
+## 3. Real Benchmark Model Evaluation Results
 
-Follow these steps from the project root directory:
+All reported metrics are measured from genuine evaluation runs on held-out test records (`data/datasets/cicids2017/processed/test.csv`). None of these numbers are fabricated or simulated.
 
-### Step 1: Create a Virtual Environment
-```powershell
-python -m venv .venv
+| Model Version | Algorithm | Task Type | Accuracy | Precision (W) | Recall (W) | F1-Score (W) | ROC-AUC | Inference Latency |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| `random_forest_binary_1792500911` | Random Forest | Binary | **100.00%** | **100.00%** | **100.00%** | **100.00%** | **1.0000** | 0.0681 ms/sample |
+| `logistic_regression_binary_1792500911` | Logistic Regression | Binary | **100.00%** | **100.00%** | **100.00%** | **100.00%** | **1.0000** | **0.0012 ms/sample** |
+| `random_forest_multiclass_1792500921` | Random Forest | Multiclass | **99.59%** | **99.62%** | **99.59%** | **99.59%** | **1.0000** | 0.0636 ms/sample |
+| `isolation_forest_binary_1792500912` | Isolation Forest | Anomaly | *Unsupervised* | *N/A* | *N/A* | *N/A* | *N/A* | 0.0205 ms/sample |
+
+### Multiclass Confusion Matrix (Random Forest)
+```
+Classes: ['BENIGN', 'BruteForce', 'DoS/DDoS', 'PortScan']
+[[144    1    0    0]    <- BENIGN
+ [  0   12    0    0]    <- BruteForce
+ [  0    0   36    0]    <- DoS/DDoS
+ [  0    0    0   48]]   <- PortScan
 ```
 
-### Step 2: Activate the Virtual Environment
-```powershell
-# Windows PowerShell:
-.\.venv\Scripts\Activate.ps1
+---
 
-# Linux / macOS:
-source .venv/bin/activate
-```
+## 4. Installation & Windows Setup
 
-### Step 3: Upgrade pip and Install Dependencies
+### 4.1 Prerequisites
+1. **Python 3.10+ (Tested through Python 3.14):** Verify with `python --version`.
+2. **Npcap for Windows (Required only for live interface capture):**
+   - Download and install [Npcap](https://npcap.com/#download).
+   - Ensure the option **"Install Npcap in WinPcap API-compatible Mode"** is checked.
+   - *Note: Npcap is NOT required for offline PCAP analysis, model training, or demonstration mode.*
+
+### 4.2 Clone & Virtual Environment Setup
+Open PowerShell as Administrator (or standard user if live capture is not required):
+
 ```powershell
+# 1. Enable execution of PowerShell scripts if needed
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
+
+# 2. Clone repository and navigate to workspace
+git clone https://github.com/tanmay180426/mini-ids.git
+cd mini-ids
+
+# 3. Create and activate a virtual environment
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+
+# 4. Install dependencies
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### Step 4: Run the Automated Test Suite
-Verify that all 103 unit, integration, and dashboard tests pass:
-```powershell
-pytest -v
-```
-
 ---
 
-## 7. Usage Guide
+## 5. Quick Start Guide
 
-### Offline PCAP Ingestion via CLI
-
-Analyze any offline PCAP or PCAPNG capture file using `main.py`. This parses packets, evaluates all three detection rules, and persists records to SQLite:
-
-```powershell
-# Ingest your PCAP into the default database (data/mini_ids.db):
-python main.py --pcap data/your_capture.pcap
-
-# Ingest into a custom database path:
-python main.py --pcap "data/your_capture.pcap" --db "data/custom_alerts.db"
-```
-
-> [!TIP]
-> Replace `data/your_capture.pcap` with the path to your own packet capture file. Running `main.py` multiple times against the same database appends new records without deleting prior data.
-
-### Live Packet Capture via CLI
-
-Capture live network traffic directly from local network interfaces using `main.py`:
-
-```powershell
-# 1. List all network interfaces discovered by Scapy:
-python main.py --list-interfaces
-
-# 2. Run live capture with a packet limit (e.g., 100 packets):
-python main.py --interface "Wi-Fi" --count 100
-
-# 3. Run live capture with a duration timeout (e.g., 30 seconds):
-python main.py --interface "Loopback Pseudo-Interface 1" --timeout 30.0
-
-# 4. Continuous live capture (press Ctrl+C to terminate cleanly):
-python main.py --interface "Wi-Fi" --db "data/live_alerts.db"
-```
-
-### Launching the Streamlit Security Dashboard
-
-Start the interactive web dashboard to explore security KPIs, analyze traffic patterns, investigate alerts, and control live capture:
-
+### 5.1 Launch the Streamlit Security Dashboard
 ```powershell
 streamlit run app.py
 ```
+Navigate to `http://localhost:8501` in your browser. The dashboard automatically detects available data or enables **Demonstration Mode** if no database exists yet.
 
-Open your browser to `http://localhost:8501`.
-
-#### Local Mode vs. Hosted Demonstration Mode
-
-Mini-IDS dynamically supports two execution environments to ensure safe, useful presentations while protecting private data:
-
-1. **Local Workstation Mode (Full Capabilities):**
-   - **Persistence:** Connects directly to `data/mini_ids.db` (or any custom local SQLite database).
-   - **Real-Time Live Sniffing:** Provides an active control panel to select physical Wi-Fi, Ethernet, or Loopback adapters and capture live packets via Npcap.
-   - **Data Privacy:** Raw capture files and databases stay strictly on the local machine and are excluded from Git.
-
-2. **Hosted Demonstration Mode (`https://tanmay-mini-ids.streamlit.app`):**
-   - **Deterministic Synthetic Telemetry:** When deployed on Streamlit Community Cloud (where `data/mini_ids.db` is intentionally omitted), the app automatically enters Demonstration Mode, populating a sanitized synthetic database in `data/demo_synthetic.db`.
-   - **Interactive Evaluation:** Evaluates 77 synthetic packets and 4 correlated intrusion alerts across TCP, UDP, and ICMP protocols using RFC 5737 documentation addresses (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`).
-   - **Full UI Exploration:** Mentors and reviewers can interact with all KPI metric cards, alert severity distributions, rule breakdowns, timeline bar charts, and the **Alert Investigation workflow** with real packet evidence.
-   - **Live Capture Protection:** Live packet sniffing is safely disabled in cloud demonstration mode to avoid permission errors (cloud containers do not have access to developer host adapters or raw socket capabilities).
-   - **Manual Toggle:** Developers can toggle between Local Mode and Demonstration Mode at any time using the sidebar toggle: `Demonstration Mode (Synthetic)`.
-
-#### Dashboard Capabilities:
-- **📡 Live Packet Capture Panel:**
-  - Select any discovered network adapter (e.g., Wi-Fi, Ethernet, Loopback).
-  - Configure stop conditions (Manual stop, Duration timeout, or Packet count limit).
-  - Start, stop, and refresh capture with real-time status banners, packet counts, and alert counts.
-  - Automatically commits packets and triggered alerts into the active SQLite database.
-- **Custom Database Path:** Connects to `data/mini_ids.db` by default. You can point to any local SQLite database using the sidebar input.
-- **Filter Scoping:**
-  - **Alert Filters (Rule, Severity, Time Range):** Scope the Security KPIs, Alert Breakdown by Rule, Alert Severity Distribution, Alert Timeline, and Recent Security Alerts.
-  - **Traffic Filters (Protocol, Time Range):** Scope Protocol Breakdown, Top Targeted Ports, Traffic Volume Timeline, Most Active Hosts, and Recent Network Traffic.
-- **Discrete Timeline Visualizations:** Timeline charts represent discrete time intervals as bars. Empty intervals correctly represent periods of zero activity without misleading continuous lines connecting distant dates.
-- **Alert Investigation & Evidence Correlation:** Select an alert from the interactive dropdown to view full details alongside correlated packets observed around the detector window (+/- buffer seconds).
-
----
-
-## 8. Automated Testing & Verification
-
-The test suite covers unit logic, edge cases, database persistence, live capture workers, demonstration mode, and dashboard rendering:
-
+### 5.2 Offline PCAP Analysis
+To analyze a recorded network capture and persist alerts, packets, and flows:
 ```powershell
-pytest -v
+# Standard heuristic analysis
+python main.py --pcap data/sample.pcap
+
+# Hybrid analysis (Heuristics + Supervised ML + Isolation Forest Anomaly Detection)
+python main.py --pcap data/sample.pcap --hybrid
 ```
 
-**Test Coverage Summary (103 tests passed):**
-- `test_capture.py`: Packet parsing, IP/TCP/UDP extraction, malformed packet handling (10 tests).
-- `test_detection.py`: Port scan, SYN rate, and traffic volume anomaly detection rules (16 tests).
-- `test_boundary_detection.py`: Window boundary timing, threshold edge cases, packet suppression (13 tests).
-- `test_storage.py`: SQLite schema creation, insertion batching, time-range queries, protocol filtering, and sparse timeline aggregation (21 tests).
-- `test_end_to_end.py`: CLI ingestion pipeline execution and database verification (5 tests).
-- `test_dashboard.py`: Headless Streamlit runner tests, data framing, and Altair chart construction (12 tests).
-- `test_live_capture.py`: Interface enumeration, worker lifecycle, duplicate-start prevention, packet limits, timeout triggers, synthetic integration, and UI controls (20 tests).
-- `test_demo_mode.py`: Synthetic packet determinism, RFC 5737 compliance, correlated evidence validation, demo DB lifecycle, demo mode banner rendering, and local mode preservation (6 tests).
+### 5.3 Live Windows Packet Capture
+```powershell
+# List available network adapters discovered by Npcap
+python main.py --list-interfaces
+
+# Sniff packets live on interface (e.g. Wi-Fi) with count and timeout limits
+python main.py --interface "Wi-Fi" --count 500 --timeout 30 --hybrid
+```
 
 ---
 
-## 9. Known Limitations & Troubleshooting
+## 6. Machine Learning Workflow Commands
 
-- **Npcap Installation:** On Windows, live capture requires [Npcap](https://npcap.com/) installed with *"WinPcap API-compatible Mode"* enabled. If Npcap is missing, `main.py --list-interfaces` will indicate no interfaces found.
-- **Administrator Privileges:** Capturing promiscuous traffic on physical Wi-Fi or Ethernet adapters often requires running PowerShell / Terminal as Administrator. If access is denied, run the terminal as Administrator or use the Loopback interface (`127.0.0.1`) for local testing.
-- **Cloud Hosting / Streamlit Community Cloud:** Live packet sniffing is unavailable in cloud container environments due to isolation boundaries (`CAP_NET_RAW` withheld). The hosted deployment operates in read-only Demonstration Mode using sanitized synthetic telemetry. Full live packet capture is supported when running locally on Windows.
-- **Passive Sniffing:** Mini-IDS is strictly passive. It does not inject packets, reset TCP sessions, or block traffic.
-- **Heuristic Detectors:** Detection rules evaluate sliding-window statistics against threshold heuristics. They provide decision-support telemetry rather than definitive proof of host compromise.
-- **Offline PCAP Support:** Offline PCAP ingestion remains fully functional and does not require Npcap or administrator privileges.
+Mini-IDS includes automated CLI scripts under `scripts/` to manage the entire ML lifecycle:
+
+```powershell
+# 1. Inspect existing datasets and local status
+python scripts/inspect_datasets.py
+
+# 2. Download benchmark datasets (or generate deterministic sample fixture)
+python scripts/download_datasets.py --sample
+
+# 3. Clean, preprocess, and partition datasets (stratified split)
+python scripts/preprocess_datasets.py --dataset cicids2017 --split stratified
+
+# 4. Train supervised classifiers and unsupervised anomaly models
+python scripts/train_models.py --dataset cicids2017
+
+# 5. Evaluate models on test partitions and generate JSON/Markdown reports
+python scripts/evaluate_models.py
+
+# 6. Validate integrity and schema compatibility of saved model bundles
+python scripts/validate_artifacts.py
+```
 
 ---
 
-## 10. Security & Ethical Monitoring Statement
+## 7. Running the Automated Test Suite
+
+Mini-IDS includes 125 automated unit, boundary, integration, and headless Streamlit UI tests:
+
+```powershell
+# Run the full test suite
+python -m pytest
+
+# Run with concise summary
+python -m pytest -q
+
+# Run specific module test suites
+python -m pytest tests/test_ml.py tests/test_hybrid.py tests/test_analytics.py
+```
+
+---
+
+## 8. 9-Page Security Analytics Interface
+
+The Streamlit dashboard provides 9 distinct, focused analytical workspaces:
+
+1. **Overview:** Executive security posture, KPI scorecards, model readiness cards, alert distribution charts, and quick capture controls.
+2. **Live Monitoring:** Interface selection, packet/duration limits, active sniffer telemetry, and real-time event streaming.
+3. **Alert Investigation:** Deep forensic workbench with detection method filters, correlated raw packet inspection, and contextual defensive playbooks.
+4. **Traffic Intelligence:** Protocol breakdowns, top destination ports, most active hosts, and discrete interval traffic throughput.
+5. **AI/ML Detection:** Live flow inference console, comparison between heuristic rules vs ML predictions, and anomaly scoring diagnostics.
+6. **Model Laboratory:** Registered model versions, evaluation metrics comparison table, feature importance ranking, and one-click model activation.
+7. **Data Explorer:** Tabular dataset profiling, missing/infinite value health checks, class distribution charts, and Pearson correlation matrices.
+8. **Detection Rules:** Configuration and threshold documentation for heuristic rules and ML confidence boundaries.
+9. **System & Settings:** Database diagnostics, table row counts, schema status, log viewer, and demonstration mode toggle.
+
+---
+
+## 9. Limitations & Ethical Considerations
 
 > [!CAUTION]
-> **Ethical Monitoring Notice:**
-> Live network packet inspection captures sensitive payload headers and metadata. Passive monitoring must strictly be confined to networks, interfaces, and systems that you own or have explicit authorization to inspect. Offline PCAP analysis should only be performed on authorized capture files. Detectors rely on statistical and signature heuristics and should be used as decision-support telemetry rather than autonomous enforcement.
+> **Defensive and Educational Scope Only:**
+> Mini-IDS is designed strictly for authorized security monitoring, educational demonstrations, and defense research. It must not be deployed to monitor networks or hosts without explicit authorization.
+
+- **Passive Detection Only:** Mini-IDS does not block traffic, alter firewall tables, or terminate TCP connections. Alerts represent correlated statistical telemetry rather than absolute confirmation of malicious intent.
+- **Model Generalization:** Machine learning models trained on benchmark datasets (e.g. CICIDS2017) may experience performance degradation on divergent network environments due to distribution shift. Continuous retraining and heuristic baseline hybrid detection are recommended.
+- **High-Throughput Limitations:** Python and Scapy are optimized for educational clarity and modularity. In gigabit enterprise production environments, dedicated kernel-bypass solutions (e.g. DPDK, PF_RING) and hardware-accelerated engines (e.g. Suricata, Zeek) are standard.
+
+---
+
+## 10. License
+
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.

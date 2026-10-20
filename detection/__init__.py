@@ -35,6 +35,10 @@ class Alert:
     window_seconds: float
     severity: str
     message: str
+    detection_method: str = "HEURISTIC"
+    model_version: Optional[str] = None
+    confidence: Optional[float] = None
+    anomaly_score: Optional[float] = None
 
     def to_dict(self) -> dict:
         """Convert the alert instance to a standard Python dictionary."""
@@ -44,10 +48,12 @@ class Alert:
 from detection.port_scan import PortScanDetector
 from detection.syn_rate import SynRateDetector
 from detection.traffic_anomaly import TrafficAnomalyDetector
+from detection.hybrid_detection import HybridDetectionEngine
 
 __all__ = [
     "Alert",
     "PortScanDetector",
     "SynRateDetector",
     "TrafficAnomalyDetector",
+    "HybridDetectionEngine",
 ]

@@ -34,6 +34,7 @@ def process_pcap_stream(
     detectors: Optional[List[Any]] = None,
     batch_size: int = 500,
     print_alerts: bool = True,
+    enable_hybrid: bool = False,
 ) -> Dict[str, Any]:
     """Process an offline PCAP/PCAPNG file through detectors and persist results.
 
@@ -44,10 +45,10 @@ def process_pcap_stream(
         pcap_path: Path to the .pcap or .pcapng file.
         db_path: Path to the target SQLite database file.
         detectors: Optional list of detector instances. If None, default
-                   PortScanDetector, SynRateDetector, and TrafficAnomalyDetector
-                   are instantiated with fresh state.
+                   heuristic detectors or hybrid engine are instantiated.
         batch_size: Number of packets to accumulate before committing to database.
         print_alerts: If True, prints alert notifications to stdout as they occur.
+        enable_hybrid: If True, activates flow extraction and trained ML models.
 
     Returns:
         Dict[str, Any]: Summary dictionary containing:
@@ -72,8 +73,35 @@ def process_pcap_stream(
     db = DatabaseManager(target_db_path)
     db.init_db()
 
-    # 2. Instantiate fresh detector instances if not provided
-    if detectors is None:
+    # 2. Instantiate detector instances
+    if enable_hybrid and detectors is None:
+        try:
+            from detection.hybrid_detection import HybridDetectionEngine
+            from ml.model_registry import ModelRegistry
+            registry = ModelRegistry(db_path=target_db_path)
+            sup_bundle = registry.load_active_bundle("supervised_binary") or registry.load_active_bundle()
+            anom_bundle = registry.load_active_bundle("anomaly_isolation_forest")
+
+            sup_m, sup_p, sup_meta = sup_bundle if sup_bundle else (None, None, None)
+            anom_m, anom_p, anom_meta = anom_bundle if anom_bundle else (None, None, None)
+
+            hybrid_engine = HybridDetectionEngine(
+                supervised_model=sup_m,
+                supervised_preprocessor=sup_p,
+                supervised_meta=sup_meta,
+                anomaly_model=anom_m,
+                anomaly_preprocessor=anom_p,
+                anomaly_meta=anom_meta,
+            )
+            active_detectors = [hybrid_engine]
+        except Exception as err:
+            logger.warning("Could not initialize hybrid detection engine: %s. Using heuristic detectors.", err)
+            active_detectors = [
+                PortScanDetector(),
+                SynRateDetector(),
+                TrafficAnomalyDetector(),
+            ]
+    elif detectors is None:
         active_detectors = [
             PortScanDetector(),
             SynRateDetector(),
@@ -98,10 +126,17 @@ def process_pcap_stream(
                 db.insert_packets(packet_batch)
                 packet_batch.clear()
 
-            # 4. Pass each packet to each detector exactly once
+            # 4. Pass each packet to detectors
             for detector in active_detectors:
-                alert = detector.process_packet(packet)
-                if alert is not None:
+                if hasattr(detector, "process_packet_all"):
+                    det_alerts, flows = detector.process_packet_all(packet)
+                    if flows:
+                        db.insert_flows(flows)
+                else:
+                    alt = detector.process_packet(packet)
+                    det_alerts = [alt] if alt is not None else []
+
+                for alert in det_alerts:
                     db.insert_alert(alert)
                     alerts_generated += 1
                     rule_counts[alert.rule_name] = rule_counts.get(alert.rule_name, 0) + 1
@@ -116,6 +151,22 @@ def process_pcap_stream(
         if packet_batch:
             db.insert_packets(packet_batch)
             packet_batch.clear()
+
+        # Flush remaining flows from detectors
+        for detector in active_detectors:
+            if hasattr(detector, "flush"):
+                flush_alerts, flush_flows = detector.flush()
+                if flush_flows:
+                    db.insert_flows(flush_flows)
+                for alert in flush_alerts:
+                    db.insert_alert(alert)
+                    alerts_generated += 1
+                    rule_counts[alert.rule_name] = rule_counts.get(alert.rule_name, 0) + 1
+                    if print_alerts:
+                        print(
+                            f"  -> [{alert.severity}] {alert.rule_name} | "
+                            f"{alert.src_ip} -> {alert.dst_ip} | {alert.message}"
+                        )
 
     finally:
         # Guarantee database connection is cleanly closed
@@ -179,6 +230,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=str(DEFAULT_DB_PATH),
         type=str,
         help=f"Path to SQLite database for persisting packets and alerts (default: {DEFAULT_DB_PATH}).",
+    )
+    parser.add_argument(
+        "--hybrid",
+        action="store_true",
+        help="Enable hybrid detection (heuristic rules + active supervised ML classifier + Isolation Forest anomaly detection).",
     )
     return parser
 
@@ -304,6 +360,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             pcap_path=pcap_file,
             db_path=db_file,
             print_alerts=True,
+            enable_hybrid=args.hybrid,
         )
     except FileNotFoundError as fnf_err:
         print(f"\n[ERROR] {fnf_err}", file=sys.stderr)

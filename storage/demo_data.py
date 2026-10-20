@@ -204,12 +204,23 @@ def populate_demo_database(db: DatabaseManager, base_ts: float = DEMO_BASE_TIMES
         db: Initialized or active DatabaseManager instance.
         base_ts: Reference starting timestamp in epoch seconds.
     """
+    from ml.feature_extraction import FlowFeatureExtractor
+
     db.init_db()
     packets = generate_synthetic_packets(base_ts)
     alerts = generate_synthetic_alerts(base_ts)
 
     db.insert_packets(packets)
     db.insert_alerts(alerts)
+
+    # Also extract and persist synthetic flows
+    extractor = FlowFeatureExtractor(flow_timeout=15.0)
+    flows = []
+    for p in packets:
+        flows.extend(extractor.process_packet(p))
+    flows.extend(extractor.flush())
+    if flows:
+        db.insert_flows(flows)
 
 
 def get_or_create_demo_database(
